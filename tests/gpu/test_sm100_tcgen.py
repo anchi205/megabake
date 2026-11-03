@@ -377,6 +377,59 @@ def test_sm100_tcgen_one_token_decode(monkeypatch, tmp_path):
     )
 
 
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("splits", [1, 8])
+def test_sm100_tcgen_multiple_tiles_per_worker(monkeypatch, tmp_path, fused, splits):
+    from megabake import compiler, graphed, make_backend
+    from megabake.bodies.cuda.sm90.gemm import split_k
+    from megabake.bodies.cuda.sm100 import tuning
+
+    monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
+    monkeypatch.setenv("MEGABAKE_SM100_TCGEN_TILE", "128")
+    monkeypatch.setenv("MEGABAKE_SM100_SPLIT_K", str(splits))
+    monkeypatch.setenv("MEGABAKE_SM100_EPILOGUE", "1" if fused else "0")
+    monkeypatch.setattr(compiler, "_TABLE_LAUNCH_OPS", 0)
+    # Model tuning can override the default one-wave split heuristic.
+    if splits > 1:
+        monkeypatch.setattr(tuning, "choice_for_shape", lambda *args: (128, splits))
+
+    class WideGemm(torch.nn.Module):
+        def forward(self, source, weight, residual):
+            result = source @ weight.T
+            return result + residual if fused else result
+
+    torch.manual_seed(812)
+    args = (
+        torch.randn(1, 512, device="cuda", dtype=torch.bfloat16) / 16,
+        torch.randn(32768, 512, device="cuda", dtype=torch.bfloat16) / 16,
+        torch.randn(1, 32768, device="cuda", dtype=torch.bfloat16) / 16,
+    )
+    model = WideGemm().eval()
+    backend = make_backend(
+        mode="decode", compile_kernel=True, cache=False, dump_dir=tmp_path, scheduler="phase"
+    )
+    compiled = torch.compile(model, backend=backend, fullgraph=True, dynamic=False)
+    with torch.no_grad():
+        actual = compiled(*args)
+        torch.testing.assert_close(actual, model(*args), atol=0.02, rtol=0.05)
+        generated = backend.megabake_last_compiled.generated
+        phase = next(p for p in generated.launch.phases if p.provider == "sm100_tma")
+        body = next(
+            p.body
+            for p in backend.megabake_last_compiled.plan.phases
+            if p.body.provider == "sm100_tma"
+        )
+        assert split_k(body) == splits
+        assert phase.device_tile_count * splits > generated.launch.grid_size
+        assert phase.body_name.endswith("_epilogue") is fused
+        original = tuple(tensor.clone() for tensor in args)
+        rebound = tuple(tensor + 0.125 for tensor in original)
+        graph = graphed(compiled, *args)
+        for current in (original, rebound, original):
+            actual = graph(*current)
+            torch.testing.assert_close(actual, model(*current), atol=0.02, rtol=0.05)
+
+
 def test_sm100_event_scheduler_uses_fallback_gemm(monkeypatch, tmp_path):
     from megabake import compiler, make_backend
 

@@ -3,8 +3,10 @@
 from ...interface import Generation
 from ..sm90.attention import AttentionBodyProvider
 from .gemm import BLACKWELL_ARCHITECTURES, BlackwellGemmProvider
+from .table import TABLE_GEMM
 
 GENERATION = Generation(
     architectures=BLACKWELL_ARCHITECTURES,
     providers=(BlackwellGemmProvider(), AttentionBodyProvider()),
+    table_gemms=(TABLE_GEMM,),
 )

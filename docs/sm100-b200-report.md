@@ -13,6 +13,212 @@ and the PyTorch graph used for comparison can differ as well. SM90 hardware was
 not tested after the shared compiler and attention changes. Only one SM100 B200
 was tested; the results do not establish support on other Blackwell devices.
 
+## Body provider refactor validation on 2026-11-03
+
+The GPU-specific table GEMM definitions, launch capabilities, descriptor policy,
+and target mappings are registered under `src/megabake/bodies`. Shared code
+uses those contracts to select, schedule, generate, and bind bodies. Event
+scheduling preserves the caller's target options and asks providers for bodies
+compatible with that scheduling mode. Tuning fingerprints include the new
+body contracts and implementation files, so profiles from earlier versions
+are rejected rather than reused.
+
+On one B200, the full `tests/unit` and `tests/gpu` suites reported **286
+passed, 37 skipped**. The skipped cases include Hopper-only GPU tests. A
+separate run of the expanded provider and Hopper source-generation checks
+and vendored-source checks reported **14 passed** with CUDA hidden. A CPU-only
+import without CUTLASS installed also succeeded. The Hopper table body has
+source-generation coverage, but it has not been executed on Hopper hardware
+after this refactor.
+
+All eight models were retuned independently with feature tiles 64 and 128 and
+split limits 1 and 8; all candidates completed without a reported failure.
+The chosen shape configurations were the same as in the preceding run. The
+new implementation fingerprint is
+`c62f6a5fe1331b4f0292d9a1257806add2682e88078c44e4fc140984ce16e7d7`.
+The same BF16, batch-one setup and timing methodology described in the rebase
+section were used. The following synchronized medians include host call
+overhead, exclude compilation, and are in milliseconds. Decode uses 24 samples
+after five warmups; prefill uses 12 after three warmups. The wrapper eager and
+ordinary compiled decode paths synchronize on host cache lengths, and the
+graphed PyTorch decode path uses static masked attention.
+
+| Decode model | Wrapper eager | `torch.compile` | Compiled graph | MegaBake | MegaBake graph |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| SmolLM 135M | 22.820 | 8.910 | 2.600 | 1.878 | 1.402 |
+| Qwen2 0.5B | 14.480 | 8.059 | 2.245 | 2.115 | 1.582 |
+| Qwen2.5 0.5B Instruct | 14.116 | 7.839 | 2.240 | 2.102 | 1.584 |
+| DeepSeek draft 0.6B | 14.915 | 8.151 | 2.602 | 2.084 | 1.549 |
+| Gemma 3 270M | 16.166 | 6.494 | 1.728 | 2.952 | 2.426 |
+| SmolLM 1.7B | 17.376 | 7.254 | 2.502 | 2.574 | 2.218 |
+| Gemma 2B | 11.661 | 6.160 | 2.422 | 3.726 | 3.229 |
+| Qwen3.5 0.8B | 17.210 | 5.611 | 2.283 | 5.026 | 4.449 |
+
+| 128-token prefill model | Eager | `torch.compile` | Compile reduce-overhead | MegaBake | MegaBake graph |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| SmolLM 135M | 13.613 | 5.039 | 1.970 | 4.011 | 3.514 |
+| Qwen2 0.5B | 11.830 | 4.415 | 1.949 | 5.785 | 5.288 |
+| Qwen2.5 0.5B Instruct | 12.331 | 4.744 | 2.169 | 5.794 | 5.285 |
+| DeepSeek draft 0.6B | 11.783 | 4.429 | 2.163 | 5.767 | 5.254 |
+| Gemma 3 270M | 13.736 | 2.833 | 1.488 | 5.436 | 4.968 |
+| SmolLM 1.7B | 10.588 | 3.535 | 2.427 | 9.674 | 9.235 |
+| Gemma 2B | 9.416 | 3.081 | 2.403 | 12.387 | 11.933 |
+| Qwen3.5 0.8B | 29.927 | 8.131 | 4.687 | failed | failed |
+
+Qwen3.5 prefill still fails in MegaBake semantic lowering on `aten.cumsum` and
+`aten.linalg_solve_triangular`. Its PyTorch run used reference implementations
+without the optional `causal_conv1d` and `fla` packages.
+
+The independent timer below pre-created device positions and used 24 samples
+after five warmups; it is a separate measurement from the preceding table.
+
+| Decode model | Native eager | Wrapper eager | Compiled graph | MegaBake graph |
+| --- | ---: | ---: | ---: | ---: |
+| SmolLM 135M | 13.954 | 22.105 | 1.920 | 1.374 |
+| Qwen2 0.5B | 12.117 | 14.168 | 1.677 | 1.551 |
+| Qwen2.5 0.5B Instruct | 12.175 | 14.117 | 1.677 | 1.545 |
+| DeepSeek draft 0.6B | 12.132 | 13.991 | 1.664 | 1.538 |
+| Gemma 3 270M | 15.155 | 16.915 | 1.304 | 2.437 |
+| SmolLM 1.7B | 11.350 | 18.193 | 2.013 | 2.189 |
+| Gemma 2B | 10.064 | 11.973 | 1.999 | 3.204 |
+| Qwen3.5 0.8B | 20.559 | 18.223 | 1.818 | 4.493 |
+
+The correctness check compares 128 teacher-forced decode positions against
+wrapper eager, a 40-token greedy run, and five natural prompts against native
+eager. The last column counts selected SM100 TMA phases and those with fused
+epilogues in the saved decode launch metadata. Matching top tokens does not
+mean that all logits match.
+
+| Model | Teacher top matches | Median / max relative L2 | First greedy difference | Matching prompts | TMA / fused phases |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| SmolLM 135M | 124/128 | 1.36% / 9.74% | 17 | 4/5 | 211 / 60 |
+| Qwen2 0.5B | 128/128 | 1.24% / 2.18% | 11 | 5/5 | 169 / 120 |
+| Qwen2.5 0.5B Instruct | 127/128 | 2.38% / 6.29% | none in 40 | 3/5 | 169 / 120 |
+| DeepSeek draft 0.6B | 128/128 | 1.58% / 3.10% | none in 40 | 4/5 | 169 / 120 |
+| Gemma 3 270M | 125/128 | 2.96% / 10.10% | none in 40 | 4/5 | 127 / 0 |
+| SmolLM 1.7B | 126/128 | 0.80% / 2.18% | 29 | 4/5 | 169 / 48 |
+| Gemma 2B | 128/128 | 1.45% / 21.01% | none in 40 | 4/5 | 127 / 36 |
+| Qwen3.5 0.8B | 128/128 | 1.48% / 2.93% | none in 40 | 4/5 | 151 / 48 |
+
+For each model, the recorded per-position relative errors, top mismatch
+positions, and greedy token sequences were identical to the pre-refactor run.
+All checked logits were finite; MegaBake's graph and non-graph KV states
+matched. This comparison does not establish bitwise identity of all logits.
+These are phases inside a single generated kernel, not separate GPU kernel
+launches. The Gemma 3 plan also contains 646 generic and 18 attention phases;
+the Qwen3.5 plan contains 1,308 generic, 36 warp-MMA, and 6 attention phases.
+
+### CUTLASS origin and fusion audit
+
+The SM90 body vendors an identified CUTLASS persistent GEMM and keeps its
+unmodified source for comparison. The current vendor diff reports 972
+insertions and 505 deletions, including split-K, fused epilogues, paired GEMMs,
+and weight streaming. The SM100 body is a substantially adapted
+experimental kernel based on the CUTLASS Blackwell tutorial; it is not a port
+of NVIDIA's optimized persistent GEMM. Its main loop structurally matches
+[CUTLASS 4.8.0 `fp16_gemm_0.py`](https://github.com/NVIDIA/cutlass/blob/v4.8.0/examples/python/CuTeDSL/cute/blackwell/tutorial/tutorial_gemm/fp16_gemm_0.py)
+(upstream SHA-256 `a15471df9a2a9c80a6a772416210ea256a58b142aa4b6358ca01851f6f02362a`).
+Compared with that file, the current SM100 source has 285 insertions and 224
+deletions in a `git diff --no-index` comparison. A snapshot is vendored under
+`bodies/cuda/sm100/cutlass_upstream` with two leading lint directives; after
+those directives, its bytes match the upstream hash. `tools/vendor_cutlass.py`
+checks both and shows the diff, including those two directives.
+
+The current SM100 body uses BF16 operands, FP32 accumulation, TMA loads and
+`tcgen05` tensor-core operations, with four A/B stages and one accumulator
+stage. It uses 128 threads and the same warp issues TMA loads and MMA. The
+outer table body loops over assigned tiles, but allocates and frees tensor
+memory inside each tile. MegaBake adds dynamic descriptors, small-row tiles,
+split-K partial reduction, and generated epilogues.
+The TMA path is opt-in, currently requires SM100, a cooperative phase-table
+launch, BF16, specific contiguous operand layouts, and rows and dimensions
+accepted by its tile rules. Its TMA body does not implement paired GEMMs;
+unsupported operations use other bodies where available.
+
+For the refactored SmolLM 135M decode launch, its saved launch metadata lists
+211 SM100 TMA GEMM phases out of 338 total phases, including 60 GEMM phases
+with fused epilogues and 30 with split-K 8. The generated epilogues perform
+residual addition and preserve the original BF16 rounding point. This is a
+specific measured graph, not evidence that every model operation is fused.
+The GPU test suite also compares a fused residual GEMM against its unfused
+equivalent for split-K 1 and 4.
+
+NVIDIA's [CUTLASS 4.8.0 persistent SM100 example](https://github.com/NVIDIA/cutlass/blob/v4.8.0/examples/python/CuTeDSL/cute/blackwell/kernel/dense_gemm/dense_gemm_persistent.py)
+has upstream SHA-256 `4f3d5fa8c6032c2190933cb43c71d358bb200225fe7c0ec0b54014a9a6235362`.
+It uses separate TMA and MMA warps, four epilogue warps and two accumulator
+stages. Its documented MMA N tile is at least 32, while the current decode
+body uses token tiles as small as 8. It is a standalone kernel with its own
+tile scheduler, not a drop-in device body for MegaBake's phase table. It uses
+192 threads, while the current generic and attention bodies use 128; the
+planner chooses a common block size and the current widening rule requires
+an integer multiple. Integration must reconcile participation, barriers, and
+resources as well as the tile shapes. A closer SM90-style integration should
+vendor a pinned copy, adapt the persistent
+mainloop to the enclosing cooperative launch and its barrier and scratch
+contracts, retain supported fused epilogues and split-K, and measure small-row
+decode and wider prefill separately. Any speedup remains unverified.
+
+The B200 multi-tile and fused-residual checks passed **6 tests**, including
+split-K 8, input rebinding, and repeated graph replay. PTX retained from those
+tests contains `tcgen05.mma` and TMA tensor loads; disassembly of the compiled
+binaries contains `UTCHMMA` and `UTMALDG.2D` instructions.
+
+As a separate experiment, the unmodified CUTLASS 4.8.0 persistent example and
+MegaBake were run on the same randomly initialized BF16 operands. The table
+reports median profiler-recorded GPU kernel duration in microseconds across
+32 calls, with CUDA graphs for the first two columns and eager PyTorch in the
+third. Both compared GEMMs used split-K 1 and no fused epilogue; all four
+checked outputs (graph and non-graph) matched PyTorch exactly for these
+inputs. NVIDIA's kernel used 32-token tiles and one CTA group; MegaBake used
+the token and feature tiles shown below.
+
+| Rows × features × K | CUTLASS tile | MegaBake token × feature tile | CUTLASS graph | MegaBake graph | PyTorch eager |
+| --- | --- | --- | ---: | ---: | ---: |
+| 1 × 576 × 1536 | 64 × 32 | 8 × 64 | 4.160 | 12.704 | 4.688 |
+| 8 × 576 × 1536 | 64 × 32 | 8 × 64 | 4.192 | 12.720 | 4.384 |
+| 32 × 576 × 1536 | 64 × 32 | 32 × 64 | 4.224 | 12.928 | 4.208 |
+| 128 × 576 × 1536 | 64 × 32 | 32 × 64 | 4.287 | 13.008 | 4.319 |
+| 1 × 1536 × 576 | 128 × 32 | 8 × 128 | 3.681 | 11.168 | 3.392 |
+| 32 × 1536 × 576 | 128 × 32 | 32 × 128 | 3.776 | 11.392 | 3.072 |
+
+This measures a standalone CUTLASS GEMM against a single-operation MegaBake
+launch, which includes phase-table and dynamic-descriptor work. It does not
+isolate the device body, measure a fused epilogue, or establish end-to-end
+performance after integrating the persistent kernel. Both implementations
+launched nine CTAs for the first shape; their block sizes were 192 and 128,
+respectively. The profiler observed one kernel per call for every table row.
+
+For a separate GEMM-plus-residual experiment, the unfused graph exposed the
+intermediate product as an additional output, forcing a materialized GEMM
+followed by a generic elementwise phase. The fused graph used one SM100 GEMM
+with an epilogue. Both used the same BF16 inputs, split-K 1 and feature tile
+64. Kernel times below are medians from 32 profiled graph replays. The extra
+output changes the graph contract, so this comparison does not attribute the
+entire timing difference solely to fusion.
+
+| Rows × features × K | Fused kernel µs | Materialized kernel µs | Fused elements different from eager | Max absolute difference |
+| --- | ---: | ---: | ---: | ---: |
+| 1 × 576 × 1536 | 13.376 | 15.104 | 178 / 576 | 0.001953125 |
+| 32 × 576 × 1536 | 16.992 | 16.208 | 5,547 / 18,432 | 0.00390625 |
+| 128 × 576 × 1536 | 17.024 | 16.256 | 22,398 / 73,728 | 0.00390625 |
+
+The materialized outputs matched eager exactly on these inputs. The fused
+one-row output differed from eager, `torch.addmm`, and `torch.compile` by at
+most 0.001953125; it matched an FP32 accumulation plus residual followed by a
+single BF16 rounding. The materialized result matched a reference that rounds
+the GEMM to BF16 before the residual addition. For 32 and 128 rows the fused
+outputs matched `torch.addmm` and `torch.compile` on these inputs but differed
+from eager. The FP32 references had TF32 disabled. These cases demonstrate a
+numerical limitation, not universal bounds or bitwise correctness.
+
+The new raw model results, traces, generated code, PTX, binaries, test logs,
+and comparison scripts were copied to a local archive with SHA-256
+`b20865d579b4c8b9637d6d39c4a8f1c7f6cc4e445bfddbd793a22f2dbd035941`.
+The archive is not included in this PR.
+
+The measurements in the rebase section below were made before this body
+provider refactor; they are retained as historical results.
+
 ## Rebase validation on 2026-11-03
 
 The PR was rebased onto `9af2847ca72b32653d1907bb5f75fc26aae7fd99` and

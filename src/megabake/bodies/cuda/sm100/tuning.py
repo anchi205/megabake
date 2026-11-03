@@ -21,7 +21,15 @@ def _device_details(device_index: int) -> dict:
     files = (
         Path(__file__).with_name("tcgen_gemm.py"),
         Path(__file__).with_name("gemm.py"),
+        Path(__file__).with_name("table.py"),
+        Path(__file__).with_name("__init__.py"),
+        root / "bodies/interface.py",
+        root / "bodies/catalog.py",
+        root / "bodies/gemm.py",
         root / "bodies/cuda/sm90/gemm.py",
+        root / "bodies/cuda/sm90/cutlass_gemm.py",
+        root / "bodies/cuda/sm90/__init__.py",
+        root / "bodies/cuda/sm90/table.py",
         root / "bodies/cuda/sm90/attention.py",
         *(
             root / name
@@ -34,6 +42,7 @@ def _device_details(device_index: int) -> dict:
                 "ops/attention.py",
                 "plan.py",
                 "planner.py",
+                "platform.py",
                 "regions.py",
                 "schedule.py",
             )

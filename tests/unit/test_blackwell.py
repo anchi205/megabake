@@ -154,6 +154,7 @@ def test_sm100_tcgen_is_opt_in_and_respects_policy(monkeypatch, tile):
     for blocked in (
         replace(policy, mode="decode"),
         replace(policy, table_launch=False),
+        replace(policy, event_schedule=True),
         replace(policy, target_options=BlackwellLaunchOptions(tma_gemm=False)),
     ):
         assert not any(

@@ -45,6 +45,7 @@ def _sm100_tma_candidate(program, base, target, policy, paired, fused=False):
             and not policy.target_options.tma_gemm
         )
         or not policy.table_launch
+        or policy.event_schedule
         or not mode_enabled
         or program.store.dtype != "torch.bfloat16"
     ):
@@ -100,6 +101,7 @@ def _sm100_tma_candidate(program, base, target, policy, paired, fused=False):
     return replace(
         base,
         provider="sm100_tma",
+        selection_priority=-2,
         name=(
             f"sm100_tma_swapab_{token_tile}x{feature_tile}"
             + (f"_k{splits}" if splits > 1 else "")
@@ -319,6 +321,7 @@ class BlackwellGemmProvider:
             matvec = replace(
                 base,
                 provider=self.provider_name,
+                selection_priority=-1,
                 name=name,
                 tiles=TileContract(
                     cta_shape=(rows, 16),

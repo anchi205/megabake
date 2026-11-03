@@ -50,7 +50,6 @@ except ImportError:
 
 try:
     import cutlass
-    import cutlass.utils.hopper_helpers as sm90_utils
     from cutlass import cute, pipeline, utils
     from cutlass._mlir import ir
     from cutlass._mlir.dialects import llvm
@@ -64,7 +63,6 @@ try:
 except ImportError:
     cutlass = _UnavailableBackendProxy("cutlass")
     cute = _UnavailableBackendProxy("cute")
-    sm90_utils = _UnavailableBackendProxy("sm90_utils")
     pipeline = _UnavailableBackendProxy("pipeline")
     utils = _UnavailableBackendProxy("utils")
     dsl_user_op = _UnavailableBackendProxy("dsl_user_op")
@@ -104,6 +102,5 @@ __all__ = [
     "pipeline_init_arrive",
     "pipeline_init_wait",
     "require_cuda_and_cutlass",
-    "sm90_utils",
     "utils",
 ]
