@@ -19,7 +19,7 @@ The PR was rebased onto `9af2847ca72b32653d1907bb5f75fc26aae7fd99` and
 measured on one B200 with PyTorch 2.14.0+cu130, CUTLASS DSL 4.8.0 and driver
 595.71.05. The tuning profiles use source fingerprint
 `06db1fd416166920cd55108ecc5281df80b8126d91ee50151941ec569f4bf731`.
-All four models were tuned independently over feature tiles 64 and 128 and
+All eight models were tuned independently over feature tiles 64 and 128 and
 split limits 1 and 8; each tuning run reported zero failed candidates. The
 measurements below use those selected configurations for decode. Prefill
 instead uses token tile 32, split-K 1, maximum 128 rows, and grouped attention
@@ -34,8 +34,8 @@ lengths; they are not native Hugging Face serving timings. The graphed PyTorch
 decode path uses static masked attention while MegaBake uses its cache body.
 The prefill benchmark disables KV caching and uses a 128-token repeated prompt.
 The traces contain `cudaGraphLaunch` for the two graphed decode paths and for
-the PyTorch reduce-overhead and MegaBake graphed prefill paths; the other
-variants below run without graph replay.
+the successful PyTorch reduce-overhead and MegaBake graphed prefill paths; the
+other variants below run without graph replay.
 
 | Decode model | Wrapper eager | `torch.compile` | Compiled graph | MegaBake | MegaBake graph |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -43,6 +43,10 @@ variants below run without graph replay.
 | Gemma 3 270M | 16.185 | 6.629 | 1.978 | 2.930 | 2.415 |
 | Qwen2 0.5B | 14.747 | 8.166 | 2.609 | 2.112 | 1.572 |
 | SmolLM 1.7B | 17.254 | 7.305 | 2.494 | 2.589 | 2.217 |
+| DeepSeek draft 0.6B | 14.254 | 7.860 | 2.227 | 2.090 | 1.550 |
+| Qwen2.5 0.5B Instruct | 14.093 | 7.809 | 2.239 | 2.107 | 1.583 |
+| Gemma 2B | 11.532 | 6.155 | 2.431 | 3.709 | 3.215 |
+| Qwen3.5 0.8B | 17.387 | 5.646 | 2.293 | 5.042 | 4.459 |
 
 | 128-token prefill model | Eager | `torch.compile` | Compile reduce-overhead | MegaBake | MegaBake graph |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -50,6 +54,14 @@ variants below run without graph replay.
 | Gemma 3 270M | 13.827 | 2.900 | 1.519 | 5.479 | 4.990 |
 | Qwen2 0.5B | 11.861 | 4.467 | 1.949 | 5.796 | 5.286 |
 | SmolLM 1.7B | 10.784 | 3.557 | 2.443 | 9.687 | 9.244 |
+| DeepSeek draft 0.6B | 12.231 | 4.457 | 1.940 | 5.738 | 5.252 |
+| Qwen2.5 0.5B Instruct | 11.971 | 4.573 | 1.947 | 5.798 | 5.285 |
+| Gemma 2B | 9.395 | 3.118 | 2.405 | 12.364 | 11.926 |
+| Qwen3.5 0.8B | 29.694 | 8.077 | 4.686 | failed | failed |
+
+Qwen3.5 prefill failed in MegaBake semantic lowering because `aten.cumsum`
+and `aten.linalg_solve_triangular` are unsupported. PyTorch used reference
+implementations without the optional `causal_conv1d` and `fla` packages.
 
 An independent timer prepared device positions before timing and compared
 the native Hugging Face eager cache with the explicit-cache paths. It used
@@ -62,6 +74,23 @@ direct repeat of the position-including calls in the first table.
 | Gemma 3 270M | 14.281 | 16.031 | 1.302 | 2.441 |
 | Qwen2 0.5B | 12.274 | 14.188 | 1.678 | 1.546 |
 | SmolLM 1.7B | 11.138 | 17.695 | 2.014 | 2.190 |
+| DeepSeek draft 0.6B | 12.244 | 14.215 | 1.663 | 1.540 |
+| Qwen2.5 0.5B Instruct | 12.273 | 14.224 | 1.679 | 1.554 |
+| Gemma 2B | 9.724 | 11.562 | 2.000 | 3.221 |
+| Qwen3.5 0.8B | 19.880 | 17.449 | 1.816 | 4.482 |
+
+The same independent 24-sample timer was used in the earlier 2026-10-29
+audit. The later run uses newly generated tuning choices and was measured on a
+different day, so small changes should not be attributed to the rebase.
+
+| Model | Earlier MegaBake graph | Rebased MegaBake graph |
+| --- | ---: | ---: |
+| Qwen2 0.5B | 1.557 | 1.546 |
+| DeepSeek draft 0.6B | 1.558 | 1.540 |
+| Qwen2.5 0.5B Instruct | 1.565 | 1.554 |
+| Qwen3.5 0.8B | 4.520 | 4.482 |
+| Gemma 2B | 3.164 | 3.221 |
+| Gemma 3 270M | 2.388 | 2.441 |
 
 The next table reports 128 teacher-forced decode positions against wrapper BF16
 eager, plus a separate 40-token greedy run. The last column is the number of
@@ -75,9 +104,15 @@ tokens does not mean the logits match.
 | Gemma 3 270M | 125/128 | 2.96% / 10.10% | none in 40 | 4/5 |
 | Qwen2 0.5B | 128/128 | 1.24% / 2.18% | 11 | 5/5 |
 | SmolLM 1.7B | 126/128 | 0.80% / 2.18% | 29 | 4/5 |
+| DeepSeek draft 0.6B | 128/128 | 1.58% / 3.10% | none in 40 | 4/5 |
+| Qwen2.5 0.5B Instruct | 127/128 | 2.38% / 6.29% | none in 40 | 3/5 |
+| Gemma 2B | 128/128 | 1.45% / 21.01% | none in 40 | 4/5 |
+| Qwen3.5 0.8B | 128/128 | 1.48% / 2.93% | none in 40 | 4/5 |
 
 On the five-prompt audit, the compiled PyTorch graph matched all 16 tokens on
-5/5, 5/5, 5/5 and 4/5 prompts respectively in the table's model order. For
+5/5, 5/5, 5/5, 4/5, 4/5, 4/5, 4/5 and 5/5 prompts respectively in the
+table's model order. Qwen3.5 wrapper eager matched native eager on only 3/5
+prompts. For
 Qwen2, the compiled graph's maximum prompt logit relative L2 versus native
 eager was 102.64%; its exact cause remains unresolved. All checked
 logits were finite. MegaBake graph and non-graph runs had identical logits
@@ -86,9 +121,12 @@ and KV state over all 128 teacher-forced positions for each model.
 For 128-token prefill, compiled PyTorch and MegaBake graph matched eager's
 top token at 124/128 and 124/128 positions for SmolLM 135M, 120/128 and
 124/128 for Gemma 3, 125/128 and 127/128 for Qwen2, and 126/128 and
-126/128 for SmolLM 1.7B. Their full-logit relative L2 differences were
-2.03% and 1.63%, 5.13% and 2.78%, 5.40% and 1.24%, and 1.16% and 0.80%,
-respectively.
+126/128 for SmolLM 1.7B, 127/128 and 127/128 for DeepSeek, 126/128 and
+127/128 for Qwen2.5, and 126/128 and 127/128 for Gemma 2B. Their full-logit
+relative L2 differences were 2.03% and 1.63%, 5.13% and 2.78%, 5.40% and
+1.24%, 1.16% and 0.80%, 6.36% and 1.72%, 5.58% and 2.43%, and 2.94% and
+2.16%, respectively. For Qwen3.5 prefill, compiled PyTorch matched all
+128 top tokens with 1.32% full-logit relative L2; MegaBake did not compile.
 
 For SmolLM 135M, disabling split-K matched the 40-token greedy run, but
 matched 123/128 teacher-forced top tokens. In the same no-split configuration,
@@ -108,10 +146,11 @@ passed. Ruff 0.17.3 lint and format checks passed for all changed Python files.
 Hopper regression tests have not been run on Hopper hardware.
 
 The raw logs, JSON files, profiler traces, and generated code were copied to
-the local results archive, SHA-256
-`eb99d06623bee65cd45540f5aa4ad61b7e1cd7345aaec213f5208fccfc3d358d`.
-They are not included in this PR. The Gemma 2B checkpoint was incomplete in
-the local backup and was not remeasured in this run.
+two local results archives, SHA-256
+`eb99d06623bee65cd45540f5aa4ad61b7e1cd7345aaec213f5208fccfc3d358d` and
+`d968e1e7a9a155e663be9701b53ebbc8d98155e1525f8573f8df2984337ebe51`.
+They are not included in this PR. The missing Gemma 2B weight shard was
+downloaded after authorization, and both shards matched the saved hashes.
 
 ## Earlier measurements from 2026-10-29
 
