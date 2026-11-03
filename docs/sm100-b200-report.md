@@ -349,5 +349,7 @@ Checkpoint revisions used: `Qwen/Qwen2-0.5B` at
 `b9878ad527387571519457f88a96a79c481a24ad`,
 `Qwen/Qwen2.5-0.5B-Instruct` at `7ae557604adf67be50417f59c2c2f167def9a775`,
 `Qwen/Qwen3.5-0.8B` at `2fc06364715b967f1860aea9cf38778875588b17`,
-`google/gemma-2b` at `9cf48e52b224239de00d483ec8eb84fb8d0f3a3a`, and
-`google/gemma-3-270m` at `9b0cfec892e2bc2afd938c98eabe4e4a7b1e0ca1`.
+`google/gemma-2b` at `9cf48e52b224239de00d483ec8eb84fb8d0f3a3a`,
+`google/gemma-3-270m` at `9b0cfec892e2bc2afd938c98eabe4e4a7b1e0ca1`,
+`HuggingFaceTB/SmolLM-135M` at `1d461723eec654e65efdc40cf49301c89c0c92f4`, and
+`HuggingFaceTB/SmolLM-1.7B` at `d7449ff7241c863f3e8accc475155f0f97afa011`.
