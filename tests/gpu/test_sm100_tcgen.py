@@ -379,15 +379,25 @@ def test_sm100_tcgen_one_token_decode(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("fused", [False, True])
 @pytest.mark.parametrize("splits", [1, 8])
-def test_sm100_tcgen_multiple_tiles_per_worker(monkeypatch, tmp_path, fused, splits):
+@pytest.mark.parametrize(
+    ("persistent", "acc_stages", "width"),
+    [(False, 1, 128), (True, 1, 256), (True, 2, 256), (True, 1, 128)],
+)
+def test_sm100_tcgen_multiple_tiles_per_worker(
+    monkeypatch, tmp_path, fused, splits, persistent, acc_stages, width
+):
     from megabake import compiler, graphed, make_backend
     from megabake.bodies.cuda.sm90.gemm import split_k
     from megabake.bodies.cuda.sm100 import tuning
 
+    monkeypatch.delenv("MEGABAKE_SM100_TUNING_FILE", raising=False)
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN_TILE", "128")
     monkeypatch.setenv("MEGABAKE_SM100_SPLIT_K", str(splits))
     monkeypatch.setenv("MEGABAKE_SM100_EPILOGUE", "1" if fused else "0")
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT", "1" if persistent else "0")
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_STAGES", str(acc_stages))
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_WIDTH", str(width))
     monkeypatch.setattr(compiler, "_TABLE_LAUNCH_OPS", 0)
     # Model tuning can override the default one-wave split heuristic.
     if splits > 1:
@@ -420,6 +430,7 @@ def test_sm100_tcgen_multiple_tiles_per_worker(monkeypatch, tmp_path, fused, spl
             if p.body.provider == "sm100_tma"
         )
         assert split_k(body) == splits
+        assert body.participants.participating_threads == width
         assert phase.device_tile_count * splits > generated.launch.grid_size
         assert phase.body_name.endswith("_epilogue") is fused
         original = tuple(tensor.clone() for tensor in args)
@@ -428,6 +439,136 @@ def test_sm100_tcgen_multiple_tiles_per_worker(monkeypatch, tmp_path, fused, spl
         for current in (original, rebound, original):
             actual = graph(*current)
             torch.testing.assert_close(actual, model(*current), atol=0.02, rtol=0.05)
+
+
+@pytest.mark.parametrize("rows,matvec", [(1, True), (6, False)])
+def test_persistent_gemm_with_warp_mma_fallback(monkeypatch, tmp_path, rows, matvec):
+    from megabake import compiler, graphed, make_backend
+
+    monkeypatch.delenv("MEGABAKE_SM100_TUNING_FILE", raising=False)
+    monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
+    monkeypatch.setenv("MEGABAKE_SM100_TCGEN_TILE", "128")
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT", "1")
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_WIDTH", "256")
+    monkeypatch.setenv("MEGABAKE_SM100_MATVEC", "1" if matvec else "0")
+    monkeypatch.setattr(compiler, "_TABLE_LAUNCH_OPS", 0)
+
+    class Mixed(torch.nn.Module):
+        def forward(self, source, first, second):
+            return (source @ first.T) @ second.T
+
+    torch.manual_seed(991)
+    args = (
+        torch.randn(rows, 128, device="cuda", dtype=torch.bfloat16) / 16,
+        torch.randn(256, 128, device="cuda", dtype=torch.bfloat16) / 16,
+        torch.randn(160, 256, device="cuda", dtype=torch.bfloat16) / 16,
+    )
+    model = Mixed().eval()
+    backend = make_backend(
+        mode="decode" if rows == 1 else "prefill",
+        compile_kernel=True,
+        cache=False,
+        dump_dir=tmp_path,
+        scheduler="phase",
+    )
+    compiled = torch.compile(model, backend=backend, fullgraph=True, dynamic=False)
+    with torch.no_grad():
+        output = compiled(*args)
+        torch.testing.assert_close(output, model(*args), atol=0.02, rtol=0.05)
+        bodies = [phase.body.provider for phase in backend.megabake_last_compiled.plan.phases]
+        assert "sm100_tma" in bodies and "blackwell_mma" in bodies
+        assert backend.megabake_last_compiled.plan.launch.threads_per_block == 256
+        graph = graphed(compiled, *args)
+        for current in (args, tuple(value + 0.125 for value in args), args):
+            torch.testing.assert_close(graph(*current), model(*current), atol=0.02, rtol=0.05)
+
+
+@pytest.mark.parametrize("rows", [1, 32])
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("splits", [1, 8])
+@pytest.mark.parametrize(("width", "acc_stages"), [(256, 1), (256, 2), (128, 1)])
+def test_persistent_gemm_matches_existing_body(
+    monkeypatch, tmp_path, rows, fused, splits, width, acc_stages
+):
+    from megabake import compiler, make_backend
+    from megabake.bodies.cuda.sm90.gemm import split_k
+
+    monkeypatch.delenv("MEGABAKE_SM100_TUNING_FILE", raising=False)
+    monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
+    monkeypatch.setenv("MEGABAKE_SM100_TCGEN_TILE", "64")
+    monkeypatch.setenv("MEGABAKE_SM100_TOKEN_TILE", "8" if rows == 1 else "32")
+    monkeypatch.setenv("MEGABAKE_SM100_SPLIT_K", str(splits))
+    monkeypatch.setenv("MEGABAKE_SM100_EPILOGUE", "1" if fused else "0")
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_STAGES", str(acc_stages))
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_WIDTH", str(width))
+    monkeypatch.setattr(compiler, "_TABLE_LAUNCH_OPS", 0)
+
+    class Gemm(torch.nn.Module):
+        def forward(self, source, weight, residual):
+            result = source @ weight.T
+            return result + residual if fused else result
+
+    torch.manual_seed(732)
+    args = (
+        torch.randn(rows, 1536, device="cuda", dtype=torch.bfloat16) / 16,
+        torch.randn(576, 1536, device="cuda", dtype=torch.bfloat16) / 16,
+        torch.randn(rows, 576, device="cuda", dtype=torch.bfloat16) / 16,
+    )
+    model = Gemm().eval()
+    results = []
+    for persistent in (False, True):
+        monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT", "1" if persistent else "0")
+        torch._dynamo.reset()
+        backend = make_backend(
+            mode="decode" if rows == 1 else "prefill",
+            compile_kernel=True,
+            cache=False,
+            dump_dir=tmp_path / str(persistent),
+            scheduler="phase",
+        )
+        compiled = torch.compile(model, backend=backend, fullgraph=True, dynamic=False)
+        with torch.no_grad():
+            results.append(compiled(*args).clone())
+        body = next(
+            p.body
+            for p in backend.megabake_last_compiled.plan.phases
+            if p.body.provider == "sm100_tma"
+        )
+        assert split_k(body) == splits
+    torch.testing.assert_close(results[1], results[0], atol=0, rtol=0)
+
+
+def test_sm100_persistent_default_runs_128_threads(monkeypatch, tmp_path):
+    from megabake import compiler, make_backend
+
+    monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT", "1")
+    monkeypatch.delenv("MEGABAKE_SM100_PERSISTENT_WIDTH", raising=False)
+    monkeypatch.delenv("MEGABAKE_SM100_PERSISTENT_STAGES", raising=False)
+    monkeypatch.delenv("MEGABAKE_SM100_TUNING_FILE", raising=False)
+    monkeypatch.setattr(compiler, "_TABLE_LAUNCH_OPS", 0)
+
+    class Gemm(torch.nn.Module):
+        def forward(self, source, weight):
+            return source @ weight.T
+
+    torch.manual_seed(411)
+    args = (
+        torch.randn(1, 512, device="cuda", dtype=torch.bfloat16) / 16,
+        torch.randn(256, 512, device="cuda", dtype=torch.bfloat16) / 16,
+    )
+    backend = make_backend(
+        mode="decode", compile_kernel=True, cache=False, dump_dir=tmp_path, scheduler="phase"
+    )
+    model = Gemm().eval()
+    compiled = torch.compile(model, backend=backend, fullgraph=True, dynamic=False)
+    with torch.no_grad():
+        torch.testing.assert_close(compiled(*args), model(*args), atol=0.01, rtol=0.03)
+    plan = backend.megabake_last_compiled.plan
+    body = next(phase.body for phase in plan.phases if phase.body.provider == "sm100_tma")
+    assert body.participants.participating_threads == 128
+    assert "_persistent1_w128" in body.name
+    assert "warp_specialized=True" in backend.megabake_last_compiled.generated.source
 
 
 def test_sm100_event_scheduler_uses_fallback_gemm(monkeypatch, tmp_path):

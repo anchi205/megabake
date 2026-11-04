@@ -23,12 +23,15 @@ def test_cutlass_upstream_copy_is_unmodified():
 
 
 @pytest.mark.parametrize("modify_header", [False, True])
-def test_sm100_upstream_hash_check_rejects_modified_content(monkeypatch, tmp_path, modify_header):
+@pytest.mark.parametrize("filename", ["fp16_gemm_0.py", "dense_gemm_persistent.py"])
+def test_sm100_upstream_hash_check_rejects_modified_content(
+    monkeypatch, tmp_path, modify_header, filename
+):
     spec = spec_from_file_location("vendor_cutlass", ROOT / "tools" / "vendor_cutlass.py")
     vendor = module_from_spec(spec)
     spec.loader.exec_module(vendor)
-    modified = tmp_path / "fp16_gemm_0.py"
-    reference = next(item for item in vendor.REFERENCES if item["header"])
+    modified = tmp_path / filename
+    reference = next(item for item in vendor.REFERENCES if item["original"].name == filename)
     source = reference["original"].read_bytes()
     modified.write_bytes(b"# changed\n" + source if modify_header else source + b"\n# changed\n")
     monkeypatch.setitem(reference, "original", modified)

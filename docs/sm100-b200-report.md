@@ -13,6 +13,279 @@ and the PyTorch graph used for comparison can differ as well. SM90 hardware was
 not tested after the shared compiler and attention changes. Only one SM100 B200
 was tested; the results do not establish support on other Blackwell devices.
 
+## Experimental persistent SM100 body on 2026-11-04
+
+`MEGABAKE_SM100_PERSISTENT=1` and `MEGABAKE_SM100_PERSISTENT_WIDTH=256` opt
+into a new 256-thread table body adapted from the pinned CUTLASS 4.8.0
+persistent SM100 GEMM. Four warps perform the
+epilogue, one loads tiles with TMA, one issues `tcgen05` MMA, and two wait.
+Unlike the tutorial body, its TMA, MMA and epilogue roles independently iterate
+over a CTA's tiles, and tensor memory is allocated once per phase. It supports
+the existing dynamic descriptors, small-row tiles, split-K and generated
+epilogues. It uses one CTA, not the upstream two-CTA/multicast or TMA-store
+variants. `MEGABAKE_SM100_PERSISTENT_STAGES=2` additionally opts into two
+accumulator stages; the default for the 256-thread experiment is one. The
+existing body remains the default when the persistent flag is absent. Mixed
+warp-MMA and matvec bodies keep 128 active threads when sharing the wider launch.
+The compiled test PTX contains `tcgen05.mma` and TMA tensor loads; its cubin
+disassembly contains `UTCHMMA` and `UTMALDG.2D` instructions.
+
+The final B200 unit and GPU test run reported **346 passed, 37 skipped**;
+skips include Hopper-specific tests. A targeted run reported **42 passed**
+for GEMM parity, multiple tiles, split-K, fusion and mixed fallback bodies.
+Both variants remain experimental: the 256-thread variant's model-level
+numerical behavior differs from the existing path, as shown below. The earlier
+fused residual rounding limitation also remains.
+
+The local raw results archive `megabake-persistent-validation-20261104.tar.gz`
+(not included in the PR) has SHA-256
+`b1e110736c945b23095045623c6e0e39d475f6abab7d9988d5c53677fbfd1b53`.
+
+During this work, replaying a captured graph after its compiled callable was
+collected reproduced a segmentation fault even with the original GEMM body.
+`GraphedCall` now keeps the callable alive for the graph's lifetime. The
+original and mixed-body two-graph reproductions passed after the fix, along
+with a GPU regression test. The earlier eight-model timing runs below preceded
+this generic ownership fix; it changes capture lifetime, not the replay path.
+
+### Isolated GEMMs
+
+The following are median profiler-recorded kernel durations in microseconds for
+32 CUDA graph replays on the same BF16 inputs. Each is a single-operation
+MegaBake launch, including its phase table and dynamic descriptors; they are
+not body-only or full-model timings. The one- and two-stage comparisons were
+separate runs, each with its own existing-body baseline. All use split-K 1.
+The fused rows add a BF16 residual.
+
+| Rows × features × K | Fused | Existing, run 1 | One stage | Existing, run 2 | Two stages |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1 × 576 × 1536 | no | 12.5440 | 11.7760 | 12.7365 | 11.9205 |
+| 8 × 576 × 1536 | no | 12.8000 | 11.7760 | 12.7840 | 11.8245 |
+| 32 × 576 × 1536 | no | 12.8960 | 12.0320 | 12.9120 | 12.1275 |
+| 128 × 576 × 1536 | no | 12.9915 | 12.2880 | 13.1035 | 12.3685 |
+| 1 × 1536 × 576 | no | 11.2800 | 10.9120 | 11.0720 | 10.9125 |
+| 1 × 32768 × 512 | no | 13.9840 | 12.4800 | 13.9040 | 12.6400 |
+| 1 × 576 × 1536 | yes | 13.4395 | 12.0640 | 13.3285 | 12.3360 |
+| 32 × 576 × 1536 | yes | 16.6730 | 16.0000 | 17.1360 | 15.7440 |
+
+For the two-stage run, the outputs were bitwise identical to the existing body
+for these sampled inputs. In the fused rows both bodies differed from eager:
+160/576 and 5,554/18,432 elements, respectively, with maximum absolute error
+0.00390625. Targeted tests additionally compared both accumulator-stage
+settings with the existing body bitwise for fused and plain GEMMs at split-K
+1 and 8 on their sampled inputs.
+
+For a second comparison on identical BF16 inputs, the unmodified NVIDIA
+persistent example was measured against the new one-stage MegaBake body.
+These are medians of 32 profiler-recorded GPU kernel durations, in
+microseconds. Both first columns use CUDA graphs and split-K 1; PyTorch eager
+is not graphed. None has a fused epilogue.
+
+| Rows × features × K | NVIDIA persistent graph | MegaBake persistent graph | PyTorch eager |
+| --- | ---: | ---: | ---: |
+| 1 × 576 × 1536 | 4.1600 | 11.7755 | 4.6880 |
+| 8 × 576 × 1536 | 4.1600 | 11.8720 | 4.3680 |
+| 32 × 576 × 1536 | 4.2240 | 12.0645 | 4.2080 |
+| 128 × 576 × 1536 | 4.2880 | 12.0960 | 4.2880 |
+| 1 × 1536 × 576 | 3.6800 | 10.8480 | 3.3920 |
+| 32 × 1536 × 576 | 3.7760 | 10.9760 | 3.0880 |
+
+For these inputs, both implementations' graph and non-graph outputs matched
+eager exactly. The NVIDIA kernel uses 192 threads, while MegaBake uses 256 and
+includes phase-table and descriptor work. The comparison does not isolate
+that overhead or determine how much of the remaining gap is in the GEMM body.
+
+### Initial complete-model check
+
+On SmolLM 135M, BF16 batch-one, capacity 64 and no model tuning file, the
+median synchronized full-call graph decode latency over 24 samples after five
+warmups was **1.390930 ms** for the existing body and **1.266416 ms** for the
+one-stage persistent body. Both used the same shape heuristic, split limit 8,
+and enabled supported fused epilogues. These are measurements from separate
+runs, not a claim of a stable speedup for every input or model.
+
+Both bodies were also tuned independently using five instrumented calls per
+candidate, over feature tiles 64 and 128 and split limits 1 and 8. All four
+candidates completed for each body. The choices differed for the
+`1:1536:576` shape: the existing body chose tile 128 and the persistent body
+chose tile 64. With the same capacity-64 graph benchmark, the independently
+tuned medians were **1.385377 ms** existing and **1.251253 ms** persistent.
+These tuning profiles are starting points based on instrumented phase timings,
+not an exhaustive search.
+
+For a separate 128-position teacher-forced accuracy check with capacity 192,
+the existing and one-stage bodies matched eager's top token in **124/128**
+and **122/128** positions, respectively. Their 40-token greedy sequences
+matched each other, with the first difference from eager at token 17. Both
+had finite logits and identical graph/non-graph cache states in their own run.
+These results do not establish bitwise equality of all model logits.
+The independently tuned configurations produced the same recorded accuracy
+summaries and greedy sequences as their respective heuristic configurations.
+
+The wider launch changes the non-GEMM reduction layout as well. In a separate
+64-input normalization diagnostic, 27 FP32 variances differed, by at most
+`1.1920928955078125e-07`, while all sampled BF16 normalized values matched.
+This is a plausible contributor to the model difference, not proof of its
+cause. Full-model correctness needs further investigation before enabling the
+persistent path by default.
+
+### Eight-model comparison of the 256-thread body
+
+These results were collected before the later 128-thread experiment. Both
+paths used the same BF16 checkpoints, batch size one, capacity 192, shape
+heuristic, split limit 8, and enabled supported epilogues. There was no tuning
+file. The times are synchronized complete-call CUDA graph decode medians in
+milliseconds, with 24 samples and five warmups; they include host call
+overhead. Each pair was measured in separate runs. These capacity-192 results
+are not directly comparable to the capacity-64 timing tables below.
+
+| Model | Existing | Persistent 256 | Latency change |
+| --- | ---: | ---: | ---: |
+| SmolLM 135M | 1.3861 | 1.2664 | -8.64% |
+| Qwen2 0.5B | 1.8118 | 1.6363 | -9.69% |
+| Qwen2.5 0.5B Instruct | 1.7584 | 1.6193 | -7.91% |
+| DeepSeek draft 0.6B | 1.7500 | 1.5811 | -9.65% |
+| Gemma 3 270M | 2.4225 | 2.3532 | -2.86% |
+| SmolLM 1.7B | 2.1569 | 1.9748 | -8.45% |
+| Gemma 2B | 3.1404 | 2.7207 | -13.36% |
+| Qwen3.5 0.8B | 4.3976 | 4.6312 | +5.31% |
+
+Accuracy compares 128 teacher-forced positions to wrapper eager. Relative L2
+is median / maximum across full logits. Greedy difference is the first of 40
+generated tokens that differs from eager; the last column compares the two
+MegaBake greedy sequences. Matching top tokens does not imply matching logits.
+
+| Model | Existing top | Persistent top | Existing relative L2 | Persistent relative L2 | Existing greedy difference | Persistent greedy difference | Greedy sequences match |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| SmolLM 135M | 124/128 | 122/128 | 1.36% / 9.74% | 1.39% / 7.06% | 17 | 17 | yes |
+| Qwen2 0.5B | 127/128 | 127/128 | 1.33% / 3.17% | 1.37% / 3.17% | 11 | 11 | yes |
+| Qwen2.5 0.5B Instruct | 127/128 | 127/128 | 2.43% / 5.34% | 2.41% / 4.62% | none in 40 | none in 40 | yes |
+| DeepSeek draft 0.6B | 127/128 | 127/128 | 1.85% / 4.58% | 1.82% / 4.58% | none in 40 | none in 40 | yes |
+| Gemma 3 270M | 122/128 | 123/128 | 2.98% / 10.75% | 2.99% / 8.26% | 9 | 13 | no |
+| SmolLM 1.7B | 126/128 | 125/128 | 0.80% / 2.18% | 0.77% / 2.03% | 29 | none in 40 | no |
+| Gemma 2B | 128/128 | 127/128 | 1.45% / 21.01% | 1.48% / 16.09% | none in 40 | none in 40 | yes |
+| Qwen3.5 0.8B | 128/128 | 128/128 | 1.50% / 2.57% | 1.53% / 2.54% | none in 40 | none in 40 | yes |
+
+All runs reported finite teacher logits, identical graph/non-graph KV states,
+and zero maximum graph/non-graph logit difference for the checked positions.
+The no-tuning setup differs from the tuned historical measurements below.
+
+### 128-thread warp-specialized experiment
+
+`MEGABAKE_SM100_PERSISTENT=1` uses the 128-thread variant by default; an
+explicit `MEGABAKE_SM100_PERSISTENT_WIDTH=128` selects it too. It uses
+separate TMA and MMA warps, then the original four-warp epilogue. Unlike the
+256-thread body, this variant allocates tensor memory per tile and does not
+overlap the next tile with the current epilogue. Other MegaBake bodies retain
+the original 128-thread launch.
+It supports one accumulator stage; two stages require the 256-thread body.
+The final default-128 test's generated PTX contains `tcgen05.mma` and TMA
+tensor loads; its cubin contains `UTCHMMA` and `UTMALDG.2D` instructions.
+
+For the same BF16 input in each pair, the table shows median profiler-recorded
+GPU kernel durations in microseconds over 32 CUDA graph replays. Each number
+includes the phase table and descriptors. Outputs matched the existing body
+bitwise for these sampled inputs. Fused outputs still have the eager rounding
+limitation discussed above.
+
+| Rows × features × K | Split-K | Fused | Existing | Specialized 128 | Latency change |
+| --- | ---: | --- | ---: | ---: | ---: |
+| 1 × 576 × 1536 | 1 | no | 12.5920 | 12.0965 | -3.94% |
+| 1 × 576 × 1536 | 8 | no | 37.4880 | 36.8635 | -1.67% |
+| 8 × 576 × 1536 | 1 | no | 12.8000 | 11.8560 | -7.38% |
+| 32 × 576 × 1536 | 1 | no | 13.0720 | 12.1440 | -7.10% |
+| 32 × 576 × 1536 | 8 | no | 82.7520 | 78.7995 | -4.78% |
+| 128 × 576 × 1536 | 1 | no | 13.0880 | 12.1920 | -6.85% |
+| 1 × 1536 × 576 | 1 | no | 11.0720 | 10.9120 | -1.45% |
+| 1 × 32768 × 512 | 1 | no | 14.0165 | 13.8240 | -1.37% |
+| 1 × 576 × 1536 | 1 | yes | 13.3605 | 12.5120 | -6.35% |
+| 1 × 576 × 1536 | 8 | yes | 41.5680 | 45.6960 | +9.93% |
+| 32 × 576 × 1536 | 1 | yes | 16.7365 | 16.0000 | -4.40% |
+| 32 × 576 × 1536 | 8 | yes | 103.9840 | 96.7360 | -6.97% |
+
+The same separate standalone comparison used identical BF16 inputs, split-K 1
+and no fused epilogue. Values are median profiler-recorded GPU kernel times in
+microseconds over 32 calls; the first two columns replay CUDA graphs, and
+PyTorch runs eager. Both graph and non-graph outputs matched eager exactly on
+these sampled inputs. NVIDIA's standalone kernel does not include MegaBake's
+phase-table and descriptor work, so this does not isolate the device bodies.
+
+| Rows × features × K | NVIDIA persistent graph | Specialized 128 graph | PyTorch eager |
+| --- | ---: | ---: | ---: |
+| 1 × 576 × 1536 | 4.1600 | 11.8720 | 4.6880 |
+| 8 × 576 × 1536 | 4.1600 | 11.8720 | 4.3520 |
+| 32 × 576 × 1536 | 4.2240 | 12.1440 | 4.1920 |
+| 128 × 576 × 1536 | 4.2880 | 12.2560 | 4.3035 |
+| 1 × 1536 × 576 | 3.6800 | 10.9280 | 3.3920 |
+| 32 × 1536 × 576 | 3.7760 | 10.9280 | 3.0715 |
+
+In a separate eight-model decode comparison, both paths used batch one, BF16,
+capacity 192, the same shape heuristic, split limit 8 and supported epilogues,
+with no tuning file. Times are synchronized full-call CUDA graph medians in
+milliseconds over 24 samples after five warmups. The pairs ran separately;
+small differences can be measurement noise. These runs followed the change
+that added the 128-thread variant and are separate from the 256-thread runs.
+
+| Model | Existing | Specialized 128 | Latency change | Matching teacher logits | Top matches eager | Median / max relative L2 vs eager | First greedy difference vs eager |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| SmolLM 135M | 1.3858 | 1.2859 | -7.21% | 128/128 | 124/128 | 1.36% / 9.74% | 17 |
+| Qwen2 0.5B | 1.8114 | 1.6409 | -9.41% | 128/128 | 127/128 | 1.33% / 3.17% | 11 |
+| Qwen2.5 0.5B Instruct | 1.7590 | 1.5844 | -9.92% | 128/128 | 127/128 | 2.43% / 5.34% | none in 40 |
+| DeepSeek draft 0.6B | 1.7888 | 1.6198 | -9.45% | 128/128 | 127/128 | 1.85% / 4.58% | none in 40 |
+| Gemma 3 270M | 2.4198 | 2.3598 | -2.48% | 128/128 | 122/128 | 2.98% / 10.75% | 9 |
+| SmolLM 1.7B | 2.1771 | 2.0015 | -8.07% | 128/128 | 126/128 | 0.80% / 2.18% | 29 |
+| Gemma 2B | 3.1355 | 2.7633 | -11.87% | 128/128 | 128/128 | 1.45% / 21.01% | none in 40 |
+| Qwen3.5 0.8B | 4.3869 | 4.3381 | -1.11% | 128/128 | 128/128 | 1.50% / 2.57% | none in 40 |
+
+For each model, SHA-256 hashes of the full teacher-forced logit tensor matched
+at every checked position, and the 40-token greedy sequences matched the
+existing body. This is not a claim that either matches eager exactly or that
+all possible inputs produce identical outputs. All checked logits were finite,
+and each run's graph and non-graph cache states matched.
+
+After the graph lifetime fix, both SmolLM 135M paths were tuned independently
+over feature tiles 64 and 128 and split limits 1 and 8, using five instrumented
+calls per candidate. All four candidates completed for each. The existing path
+chose tile 128 and the specialized path chose tile 64 for `1:1536:576`; their
+other recorded choices matched. With a capacity-192 CUDA graph, the tuned
+full-call medians were **1.387555 ms** and **1.2784465 ms**, respectively,
+over 24 samples after five warmups. All 128 sampled full-logit hashes and the
+40-token greedy sequences matched between these tuned runs. Each matched eager's
+top token at 124/128 teacher-forced positions. The tuning sweep is limited,
+and these settings are not established as optimal for every model.
+
+Using the same full-model timing harness in separate runs, with capacity 192,
+the independently tuned MegaBake paths and PyTorch variants produced these
+synchronized complete-call decode medians, in milliseconds. All use batch one,
+BF16, 24 samples and five warmups. Compilation is excluded.
+
+| SmolLM 135M decode variant | CUDA graph | Median ms |
+| --- | --- | ---: |
+| PyTorch wrapper eager | no | 22.671364 |
+| `torch.compile` | no | 9.083152 |
+| `torch.compile` with manual graph capture | yes | 2.658955 |
+| Existing MegaBake, tuned | yes | 1.378926 |
+| Specialized 128 MegaBake, tuned | yes | 1.265052 |
+
+The wrapper eager and ordinary compiled paths synchronize on host cache
+lengths. The manually graphed PyTorch path uses static masked attention,
+whereas MegaBake uses its cache body. These are not native serving-engine
+measurements, and the graph implementations have different work. The separate
+accuracy checks above compare MegaBake to wrapper eager; this timing run does
+not establish compiled PyTorch's numerical equivalence. The saved compiled
+graph trace contains `cudaGraphLaunch` and 842 GPU kernel events.
+
+For 128-token prefill, a separate batch-one BF16 comparison used token tile
+32, split-K 1 and grouped attention value block 8. The following medians are
+synchronized full-call CUDA graph times in milliseconds over 12 samples after
+three warmups. Full output-logit hashes matched between the two MegaBake paths.
+The eager comparison covers all 128 prompt positions.
+
+| Model | Existing | Specialized 128 | Latency change | Top matches eager | Relative L2 vs eager | Max abs vs eager |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| SmolLM 135M | 3.4938 | 3.2526 | -6.90% | 124/128 | 1.63% | 0.6875 |
+| Gemma 3 270M | 4.9760 | 4.7068 | -5.41% | 124/128 | 2.78% | 0.9375 |
+
 ## Body provider refactor validation on 2026-11-03
 
 The GPU-specific table GEMM definitions, launch capabilities, descriptor policy,
@@ -113,18 +386,19 @@ the Qwen3.5 plan contains 1,308 generic, 36 warp-MMA, and 6 attention phases.
 The SM90 body vendors an identified CUTLASS persistent GEMM and keeps its
 unmodified source for comparison. The current vendor diff reports 972
 insertions and 505 deletions, including split-K, fused epilogues, paired GEMMs,
-and weight streaming. The SM100 body is a substantially adapted
+and weight streaming. The original SM100 body is a substantially adapted
 experimental kernel based on the CUTLASS Blackwell tutorial; it is not a port
 of NVIDIA's optimized persistent GEMM. Its main loop structurally matches
 [CUTLASS 4.8.0 `fp16_gemm_0.py`](https://github.com/NVIDIA/cutlass/blob/v4.8.0/examples/python/CuTeDSL/cute/blackwell/tutorial/tutorial_gemm/fp16_gemm_0.py)
 (upstream SHA-256 `a15471df9a2a9c80a6a772416210ea256a58b142aa4b6358ca01851f6f02362a`).
-Compared with that file, the current SM100 source has 285 insertions and 224
-deletions in a `git diff --no-index` comparison. A snapshot is vendored under
+Before the later warp-specialization experiment, that SM100 source had 285
+insertions and 224 deletions in a `git diff --no-index` comparison. A snapshot
+is vendored under
 `bodies/cuda/sm100/cutlass_upstream` with two leading lint directives; after
 those directives, its bytes match the upstream hash. `tools/vendor_cutlass.py`
 checks both and shows the diff, including those two directives.
 
-The current SM100 body uses BF16 operands, FP32 accumulation, TMA loads and
+The original SM100 body uses BF16 operands, FP32 accumulation, TMA loads and
 `tcgen05` tensor-core operations, with four A/B stages and one accumulator
 stage. It uses 128 threads and the same warp issues TMA loads and MMA. The
 outer table body loops over assigned tiles, but allocates and frees tensor
@@ -138,8 +412,9 @@ unsupported operations use other bodies where available.
 For the refactored SmolLM 135M decode launch, its saved launch metadata lists
 211 SM100 TMA GEMM phases out of 338 total phases, including 60 GEMM phases
 with fused epilogues and 30 with split-K 8. The generated epilogues perform
-residual addition and preserve the original BF16 rounding point. This is a
-specific measured graph, not evidence that every model operation is fused.
+residual addition. The diagnostic below shows that fused rounding can differ
+from eager for some inputs. This is a specific measured graph, not evidence
+that every model operation is fused.
 The GPU test suite also compares a fused residual GEMM against its unfused
 equivalent for split-K 1 and 4.
 
@@ -152,11 +427,10 @@ tile scheduler, not a drop-in device body for MegaBake's phase table. It uses
 192 threads, while the current generic and attention bodies use 128; the
 planner chooses a common block size and the current widening rule requires
 an integer multiple. Integration must reconcile participation, barriers, and
-resources as well as the tile shapes. A closer SM90-style integration should
-vendor a pinned copy, adapt the persistent
-mainloop to the enclosing cooperative launch and its barrier and scratch
-contracts, retain supported fused epilogues and split-K, and measure small-row
-decode and wider prefill separately. Any speedup remains unverified.
+resources as well as the tile shapes. The experimental integration described
+above adapts that persistent structure to a 256-thread cooperative launch,
+with split-K and supported epilogues. Its model-level numerical behavior and
+wider prefill performance need further investigation.
 
 The B200 multi-tile and fused-residual checks passed **6 tests**, including
 split-K 8, input rebinding, and repeated graph replay. PTX retained from those

@@ -118,6 +118,82 @@ def test_sm100_short_row_candidates_respect_rows_and_architecture(monkeypatch, r
     )
 
 
+@pytest.mark.parametrize(
+    "persistent,stages,width", [(False, 1, 128), (True, 1, 256), (True, 2, 256), (True, 1, 128)]
+)
+def test_sm100_persistent_contract_is_opt_in(monkeypatch, persistent, stages, width):
+    from megabake.bodies.cuda.sm100.table import TABLE_GEMM
+
+    monkeypatch.delenv("MEGABAKE_SM100_TUNING_FILE", raising=False)
+    monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT", "1" if persistent else "0")
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_STAGES", str(stages))
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_WIDTH", str(width))
+    region = next(
+        r
+        for r in _regions(
+            Gemm(),
+            torch.randn(1, 512, dtype=torch.bfloat16),
+            torch.randn(256, 512, dtype=torch.bfloat16),
+        )
+        if r.tensor_programs[0].family == "contraction"
+    )
+    target = _target(architecture="sm100", supports_wgmma=False)
+    policy = SelectionPolicy(mode="decode", table_launch=True)
+    candidates = BlackwellGemmProvider().get_candidates(region, target, policy)
+    body = next(c for c in candidates.configurations if c.provider == "sm100_tma")
+    assert body.participants.participating_threads == width
+    assert (f"_persistent{stages}" in body.name) is persistent
+    definition = TABLE_GEMM.table_definition(
+        {"symbol": "gemm", "splits": 1}, (128, 8), "", False, 0
+    )
+    assert ("Sm100PersistentGemm" in definition) is (persistent and width == 256)
+    assert ("warp_specialized=True" in definition) is (persistent and width == 128)
+    if persistent and width == 256:
+        assert f"acc_stages={stages}" in definition
+    validate_body_config(body, target, policy)
+
+
+def test_sm100_128_thread_variant_rejects_two_accumulator_stages(monkeypatch):
+    from megabake.bodies.cuda.sm100.table import TABLE_GEMM
+
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT", "1")
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_WIDTH", "128")
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_STAGES", "2")
+    with pytest.raises(ValueError, match="requires one accumulator stage"):
+        TABLE_GEMM.table_definition({"symbol": "gemm", "splits": 1}, (128, 8), "", False, 0)
+
+
+def test_sm100_persistent_defaults_to_128_thread_variant(monkeypatch):
+    from megabake.bodies.cuda.sm100.table import TABLE_GEMM
+
+    monkeypatch.delenv("MEGABAKE_SM100_TUNING_FILE", raising=False)
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT", "1")
+    monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
+    monkeypatch.delenv("MEGABAKE_SM100_PERSISTENT_WIDTH", raising=False)
+    monkeypatch.delenv("MEGABAKE_SM100_PERSISTENT_STAGES", raising=False)
+    region = next(
+        r
+        for r in _regions(
+            Gemm(),
+            torch.randn(1, 512, dtype=torch.bfloat16),
+            torch.randn(256, 512, dtype=torch.bfloat16),
+        )
+        if r.tensor_programs[0].family == "contraction"
+    )
+    candidates = BlackwellGemmProvider().get_candidates(
+        region,
+        _target(architecture="sm100", supports_wgmma=False),
+        SelectionPolicy(mode="decode", table_launch=True),
+    )
+    body = next(c for c in candidates.configurations if c.provider == "sm100_tma")
+    assert body.participants.participating_threads == 128
+    definition = TABLE_GEMM.table_definition(
+        {"symbol": "gemm", "splits": 1}, (128, 8), "", False, 0
+    )
+    assert "Sm100TmaGemm" in definition and "warp_specialized=True" in definition
+
+
 @pytest.mark.parametrize("tile", ["64", "128"])
 def test_sm100_tcgen_is_opt_in_and_respects_policy(monkeypatch, tile):
     region = next(
@@ -250,6 +326,22 @@ def test_sm100_tuning_fingerprint_tracks_experimental_settings(monkeypatch):
     assert changed["fused_epilogues"] is False
     assert changed["token_tile"] == 8
     assert changed["prefill_value_block"] == 0
+
+
+def test_sm100_tuning_fingerprint_separates_persistent_variants(monkeypatch):
+    from megabake.bodies.cuda.sm100 import tuning
+
+    monkeypatch.setattr(tuning, "_device_details", lambda index: {"name": "test device"})
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT", "1")
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_WIDTH", "128")
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_STAGES", "1")
+    narrow = tuning.device_fingerprint(0)
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_WIDTH", "256")
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_STAGES", "2")
+    wide = tuning.device_fingerprint(0)
+    assert (narrow["persistent_width"], narrow["persistent_acc_stages"]) == (128, 1)
+    assert (wide["persistent_width"], wide["persistent_acc_stages"]) == (256, 2)
+    assert narrow != wide
 
 
 def test_sm100_measured_choice_controls_tile_and_split(monkeypatch):

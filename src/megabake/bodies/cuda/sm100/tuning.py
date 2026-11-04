@@ -20,6 +20,7 @@ def _device_details(device_index: int) -> dict:
     repository = root.parents[1]
     files = (
         Path(__file__).with_name("tcgen_gemm.py"),
+        Path(__file__).with_name("persistent_gemm.py"),
         Path(__file__).with_name("gemm.py"),
         Path(__file__).with_name("table.py"),
         Path(__file__).with_name("__init__.py"),
@@ -77,6 +78,17 @@ def device_fingerprint(device_index: int) -> dict:
     return {
         **_device_details(device_index),
         "fused_epilogues": os.environ.get("MEGABAKE_SM100_EPILOGUE") == "1",
+        "persistent_gemm": os.environ.get("MEGABAKE_SM100_PERSISTENT") == "1",
+        "persistent_width": 128
+        if os.environ.get("MEGABAKE_SM100_PERSISTENT") == "1"
+        and os.environ.get("MEGABAKE_SM100_PERSISTENT_WIDTH") != "256"
+        else 256
+        if os.environ.get("MEGABAKE_SM100_PERSISTENT") == "1"
+        else 128,
+        "persistent_acc_stages": 2
+        if os.environ.get("MEGABAKE_SM100_PERSISTENT") == "1"
+        and os.environ.get("MEGABAKE_SM100_PERSISTENT_STAGES") == "2"
+        else 1,
         "decode_second_wave_keys": DECODE_SECOND_WAVE_KEYS,
         "token_tile": int(token_setting) if token_setting in {"8", "16", "32"} else 8,
         "prefill_value_block": _prefill_value_block(),

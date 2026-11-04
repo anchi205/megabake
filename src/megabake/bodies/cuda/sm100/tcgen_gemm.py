@@ -110,6 +110,7 @@ def _run_tcgen_tile(
     split_state,
     epilogues,
     epilogue_state,
+    warp_specialized: cutlass.Constexpr = False,
 ):
     mma_tiler_mnk = (feature_tile, token_tile, 64)
     mC_mnl = cute.make_tensor(
@@ -257,56 +258,92 @@ def _run_tcgen_tile(
     #
     num_k_tiles = cute.size(gA, mode=[2]) // splits
     k_start = split_index * num_k_tiles
-    if warp_idx == 0:
-        # Wait for a empty accumulator buffer
-        acc_empty = acc_producer.acquire_and_advance()
-        for k_tile_idx in cutlass.range(num_k_tiles, prefetch_stages=ab_stages - 2):
-            # Issue TMA loads
-            ab_empty = ab_producer.acquire_and_advance()
-            cute.copy(
-                tma_atom_a,
-                tAgA[(None, k_start + ab_empty.count)],
-                tAsA[(None, ab_empty.index)],
-                tma_bar_ptr=ab_empty.barrier,
-                tma_desc_ptr=desc_a,
-            )
-            cute.copy(
-                tma_atom_b,
-                tBgB[(None, k_start + ab_empty.count)],
-                tBsB[(None, ab_empty.index)],
-                tma_bar_ptr=ab_empty.barrier,
-                tma_desc_ptr=desc_b,
-            )
-
-            # Execute one K-block worth of MMA instructions
-            ab_full = ab_consumer.wait_and_advance()
-            num_k_blocks = cute.size(tCrA, mode=[2])
-            for k_block_idx in cutlass.range_constexpr(num_k_blocks):
-                k_block_coord = (None, None, k_block_idx, ab_full.index)
-                cute.gemm(
-                    tiled_mma,
-                    tCtAcc,
-                    tCrA[k_block_coord],
-                    tCrB[k_block_coord],
-                    tCtAcc,
+    if cutlass.const_expr(warp_specialized):
+        # Producer/consumer warp roles follow the CUTLASS persistent GEMM. All
+        # four warps join the epilogue once the MMA warp completes this tile.
+        if warp_idx == 0:
+            for _ in cutlass.range(0, num_k_tiles, 1, unroll=1):
+                ab_empty = ab_producer.acquire_and_advance()
+                cute.copy(
+                    tma_atom_a,
+                    tAgA[(None, k_start + ab_empty.count)],
+                    tAsA[(None, ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
+                    tma_desc_ptr=desc_a,
                 )
-                tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                cute.copy(
+                    tma_atom_b,
+                    tBgB[(None, k_start + ab_empty.count)],
+                    tBsB[(None, ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
+                    tma_desc_ptr=desc_b,
+                )
+        if warp_idx == 1:
+            acc_empty = acc_producer.acquire_and_advance()
+            for _ in cutlass.range(0, num_k_tiles, 1, unroll=1):
+                ab_full = ab_consumer.wait_and_advance()
+                num_k_blocks = cute.size(tCrA, mode=[2])
+                for k_block_idx in cutlass.range_constexpr(num_k_blocks):
+                    k_block_coord = (None, None, k_block_idx, ab_full.index)
+                    cute.gemm(tiled_mma, tCtAcc, tCrA[k_block_coord], tCrB[k_block_coord], tCtAcc)
+                    tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                ab_full.release()
+            acc_empty.commit()
+    else:
+        if warp_idx == 0:
+            # Wait for a empty accumulator buffer
+            acc_empty = acc_producer.acquire_and_advance()
+            for k_tile_idx in cutlass.range(num_k_tiles, prefetch_stages=ab_stages - 2):
+                # Issue TMA loads
+                ab_empty = ab_producer.acquire_and_advance()
+                cute.copy(
+                    tma_atom_a,
+                    tAgA[(None, k_start + ab_empty.count)],
+                    tAsA[(None, ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
+                    tma_desc_ptr=desc_a,
+                )
+                cute.copy(
+                    tma_atom_b,
+                    tBgB[(None, k_start + ab_empty.count)],
+                    tBsB[(None, ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
+                    tma_desc_ptr=desc_b,
+                )
 
-            # Signal that the A/B buffers have been consumed and are ready for the next load
-            ab_full.release()
+                # Execute one K-block worth of MMA instructions
+                ab_full = ab_consumer.wait_and_advance()
+                num_k_blocks = cute.size(tCrA, mode=[2])
+                for k_block_idx in cutlass.range_constexpr(num_k_blocks):
+                    k_block_coord = (None, None, k_block_idx, ab_full.index)
+                    cute.gemm(
+                        tiled_mma,
+                        tCtAcc,
+                        tCrA[k_block_coord],
+                        tCrB[k_block_coord],
+                        tCtAcc,
+                    )
+                    tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
-        # Signal that the accumulator is fully computed
-        acc_empty.commit()
+                # Signal that the A/B buffers have been consumed and are ready for the next load
+                ab_full.release()
+
+            # Signal that the accumulator is fully computed
+            acc_empty.commit()
 
     #
     # 3. Epilogue
     #
 
-    # Release TMEM allocation lock
-    tmem.relinquish_alloc_permit()
+    # The specialized load warp can finish before the MMA warp. Keep its
+    # allocation permit until the accumulator is complete in that variant.
+    if cutlass.const_expr(not warp_specialized):
+        tmem.relinquish_alloc_permit()
 
     # Wait for the accumulator buffer to be full
     acc_full = acc_consumer.wait_and_advance()
+    if cutlass.const_expr(warp_specialized):
+        tmem.relinquish_alloc_permit()
 
     if cutlass.const_expr(splits == 1):
         for i in cutlass.range(cute.size(tDtC, mode=[2])):
@@ -432,7 +469,14 @@ class Sm100TmaGemm:
 
     shared_storage = SharedStorage
 
-    def __init__(self, feature_tile: int = 128, splits: int = 1, token_tile: int = 8, epilogues=()):
+    def __init__(
+        self,
+        feature_tile: int = 128,
+        splits: int = 1,
+        token_tile: int = 8,
+        epilogues=(),
+        warp_specialized: bool = False,
+    ):
         if feature_tile not in (64, 128):
             raise ValueError("SM100 tcgen feature tile must be 64 or 128")
         self.feature_tile = feature_tile
@@ -442,6 +486,7 @@ class Sm100TmaGemm:
         self.token_tile = token_tile
         self.shared_storage = SharedStorage if token_tile == 8 else SharedStorageWide
         self.epilogues = epilogues
+        self.warp_specialized = warp_specialized
 
     @cute.jit
     def prepare(self, a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, max_active_clusters):
@@ -521,4 +566,5 @@ class Sm100TmaGemm:
                 split_state,
                 self.epilogues,
                 epilogue_state,
+                self.warp_specialized,
             )

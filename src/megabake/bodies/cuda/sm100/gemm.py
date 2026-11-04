@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import textwrap
 from dataclasses import dataclass, replace
 
 from ....graph import Region
@@ -19,6 +20,7 @@ from ...interface import (
     TargetFacts,
     TileContract,
     validate_body_config,
+    widened_participants,
 )
 from ..generic import GeneratedContractionBody, generic_config
 
@@ -96,6 +98,11 @@ def _sm100_tma_candidate(program, base, target, policy, paired, fused=False):
             splits = count
     if measured is not None:
         splits = measured[1]
+    persistent = os.environ.get("MEGABAKE_SM100_PERSISTENT") == "1"
+    acc_stages = 2 if os.environ.get("MEGABAKE_SM100_PERSISTENT_STAGES") == "2" else 1
+    persistent_width = 256 if os.environ.get("MEGABAKE_SM100_PERSISTENT_WIDTH") == "256" else 128
+    if persistent and persistent_width == 128 and acc_stages != 1:
+        raise ValueError("the 128-thread persistent variant requires one accumulator stage")
     from ..generic import _layouts
 
     return replace(
@@ -104,6 +111,8 @@ def _sm100_tma_candidate(program, base, target, policy, paired, fused=False):
         selection_priority=-2,
         name=(
             f"sm100_tma_swapab_{token_tile}x{feature_tile}"
+            + (f"_persistent{acc_stages}" if persistent else "")
+            + ("_w128" if persistent and persistent_width == 128 else "")
             + (f"_k{splits}" if splits > 1 else "")
             + ("_epilogue" if fused else "")
         ),
@@ -116,9 +125,15 @@ def _sm100_tma_candidate(program, base, target, policy, paired, fused=False):
             reduction_tile=(64,),
         ),
         participants=ParticipantContract(
-            participating_threads=128,
-            waiting_threads=128,
-            warp_roles=("tma_mma", "epilogue", "epilogue", "epilogue"),
+            participating_threads=persistent_width if persistent else 128,
+            waiting_threads=persistent_width if persistent else 128,
+            warp_roles=(
+                ("epilogue",) * 4 + ("tma", "mma", "idle", "idle")
+                if persistent and persistent_width == 256
+                else ("tma_epilogue", "mma_epilogue", "epilogue", "epilogue")
+                if persistent
+                else ("tma_mma", "epilogue", "epilogue", "epilogue")
+            ),
             registers_per_thread=128,
         ),
         pipeline=replace(
@@ -138,9 +153,14 @@ def _sm100_tma_candidate(program, base, target, policy, paired, fused=False):
         ),
         evidence=ResourceEvidence(
             measured=False,
-            source="experimental SM100 TMA/tcgen05 pipeline",
-            revision="cutlass-4.8.0-tutorial",
-            resources={"threads": 128, "shared_bytes": 73_728 if token_tile == 8 else 86_016},
+            source="experimental SM100 persistent pipeline"
+            if persistent
+            else "experimental SM100 TMA/tcgen05 pipeline",
+            revision="cutlass-4.8.0-persistent" if persistent else "cutlass-4.8.0-tutorial",
+            resources={
+                "threads": persistent_width if persistent else 128,
+                "shared_bytes": 73_728 if token_tile == 8 else 86_016,
+            },
             measurements={},
         ),
     )
@@ -157,12 +177,32 @@ class BlackwellGemmProvider:
         defer_length_publish: bool = False,
         workers: int | None = None,
     ) -> GeneratedContractionBody:
-        return emit_blackwell_gemm(program, config)
+        generated = emit_blackwell_gemm(program, config)
+        if config.participants.participating_threads == 256:
+            marker = "    workers, _, _ = cute.arch.grid_dim()\n"
+            if generated.source.count(marker) != 1:
+                raise ValueError("unexpected warp-MMA source while widening the block")
+            head, body = generated.source.split(marker, 1)
+            generated = replace(
+                generated,
+                source=head + marker + "    if thread < 128:\n" + textwrap.indent(body, "    "),
+                threads_per_cta=256,
+            )
+        return generated
 
     def widen(self, program: TensorProgram, config: BodyConfig, threads: int) -> BodyConfig:
-        if threads != config.participants.participating_threads:
-            raise ValueError("the warp-MMA GEMM body runs four warps per CTA")
-        return config
+        if threads == config.participants.participating_threads:
+            return config
+        if threads != 256 or config.participants.participating_threads != 128:
+            raise ValueError("the warp-MMA GEMM body requires 128 active threads")
+        participants = widened_participants(config, threads)
+        return replace(
+            config,
+            participants=replace(
+                participants,
+                warp_roles=config.participants.warp_roles + ("idle",) * 4,
+            ),
+        )
 
     def get_candidates(
         self, region: Region, target: TargetFacts, policy: SelectionPolicy
