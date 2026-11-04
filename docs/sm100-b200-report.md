@@ -13,6 +13,77 @@ and the PyTorch graph used for comparison can differ as well. SM90 hardware was
 not tested after the shared compiler and attention changes. Only one SM100 B200
 was tested; the results do not establish support on other Blackwell devices.
 
+## Paired graph comparison on 2026-11-04
+
+The following measurements used code commit `5e3d28a`, one B200, BF16, batch
+one and an explicit cache of capacity 192. Both paths replay CUDA graphs;
+MegaBake uses the opt-in 128-thread warp-specialized body, the shape heuristic
+and no tuning file. Each median is synchronized host time over 24 calls after
+five warmups, with position tensors prepared before timing. The graph paths use
+different attention and cache implementations. The compiled PyTorch graph is
+captured manually. Qwen3.5 used PyTorch reference implementations without the
+optional `causal_conv1d` and `flash-linear-attention` packages.
+
+Prompt columns count the five prompts whose full 16-token continuation matched
+native Hugging Face eager; they do not establish logit equality.
+
+| Model | PyTorch graph ms | MegaBake graph ms | PyTorch prompts | MegaBake prompts |
+| --- | ---: | ---: | ---: | ---: |
+| SmolLM 135M | 1.995840 | 1.276789 | 5/5 | 4/5 |
+| Qwen2 0.5B | 1.712792 | 1.590118 | 5/5 | 4/5 |
+| Qwen2.5 0.5B Instruct | 1.710248 | 1.576747 | 4/5 | 3/5 |
+| DeepSeek draft 0.6B | 1.695229 | 1.582237 | 4/5 | 3/5 |
+| Gemma 3 270M | 1.336688 | 2.322266 | 5/5 | 4/5 |
+| SmolLM 1.7B | 2.038934 | 1.976711 | 4/5 | 4/5 |
+| Gemma 2B | 2.016426 | 2.738298 | 4/5 | 4/5 |
+| Qwen3.5 0.8B | 1.838671 | 4.341461 | 5/5 | 4/5 |
+
+`tools/benchmark_sm100_graphs.py` now runs the same audit with its capacity
+set to 192, including both graph timings and the five-prompt checks. The table
+above was recorded before the runner was added; the runner itself has not been
+rebenchmarked. It reports per-model JSON and logs, a CSV summary and run
+settings. Supply local checkpoint directories with the following names:
+
+| Directory | Hugging Face checkpoint |
+| --- | --- |
+| `smollm-135m` | `HuggingFaceTB/SmolLM-135M` |
+| `qwen2-0.5b` | `Qwen/Qwen2-0.5B` |
+| `qwen2.5-0.5b-instruct` | `Qwen/Qwen2.5-0.5B-Instruct` |
+| `deepseek-draft` | `jukofyork/DeepSeek-V3-DRAFT-0.6B-v3.0` |
+| `gemma-3-270m` | `google/gemma-3-270m` |
+| `smollm-1.7b` | `HuggingFaceTB/SmolLM-1.7B` |
+| `gemma-2b` | `google/gemma-2b` |
+| `qwen3.5-0.8b` | `Qwen/Qwen3.5-0.8B` |
+
+The exact checkpoint revisions are listed in the reproduction section below.
+For example, prepare the first directory with `hf download` after installing
+the repository environment:
+
+```bash
+export MODEL_ROOT=/path/to/models
+hf download HuggingFaceTB/SmolLM-135M \
+  --revision 1d461723eec654e65efdc40cf49301c89c0c92f4 \
+  --local-dir "$MODEL_ROOT/smollm-135m"
+```
+
+Prepare the remaining directories similarly. Gemma checkpoints require the
+appropriate Hugging Face access and login. The runner loads checkpoints offline
+and never downloads them. Run it from the repository root:
+
+```bash
+python tools/benchmark_sm100_graphs.py --models-root "$MODEL_ROOT" \
+  --threads 128 --out /tmp/megabake-graphs-128
+
+python tools/benchmark_sm100_graphs.py --models-root "$MODEL_ROOT" \
+  --threads 256 --out /tmp/megabake-graphs-256
+```
+
+Use a new or empty output directory. `--models smollm-135m` limits the run to
+one checkpoint; `--capacity`, `--samples`, and `--warmups` can override the
+defaults. The 256-thread body is experimental and can change model outputs.
+`--threads 256 --stages 2` selects its two-accumulator-stage experiment.
+The 128-thread body requires one stage.
+
 ## Experimental persistent SM100 body on 2026-11-04
 
 `MEGABAKE_SM100_PERSISTENT=1` and `MEGABAKE_SM100_PERSISTENT_WIDTH=256` opt

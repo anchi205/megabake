@@ -7,6 +7,7 @@ as the original benchmark. Native eager uses Transformers' growing cache.
 
 from __future__ import annotations
 
+import argparse
 import json
 import statistics
 import sys
@@ -20,7 +21,26 @@ sys.path.insert(0, str(Path.cwd()))
 from benchmarks.full_model import GraphedStep, _load, decode_module
 from megabake import graphed, make_backend
 
-model_path, output_path = sys.argv[1:3]
+parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+parser.add_argument("model_path", help="local Hugging Face checkpoint directory")
+parser.add_argument("output_path", help="path to the result JSON")
+parser.add_argument("--capacity", type=int, default=64, help="explicit KV-cache capacity")
+parser.add_argument("--warmups", type=int, default=5)
+parser.add_argument("--samples", type=int, default=24)
+parser.add_argument("--generated-tokens", type=int, default=16)
+args = parser.parse_args()
+model_path, output_path = args.model_path, args.output_path
+warmups, samples, capacity, generated_tokens = (
+    args.warmups,
+    args.samples,
+    args.capacity,
+    args.generated_tokens,
+)
+if warmups < 0 or samples < 1 or generated_tokens < 1 or capacity < warmups + samples:
+    parser.error(
+        "warmups must be non-negative; samples and generated tokens must be positive; "
+        "capacity must hold all timed positions"
+    )
 prompts = [
     "The capital of France is",
     "Explain why the sky appears blue.",
@@ -28,7 +48,6 @@ prompts = [
     "2 + 2 =",
     "Once upon a time in a distant village,",
 ]
-warmups, samples, capacity, generated_tokens = 5, 24, 64, 16
 tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
 prompt_ids = [tokenizer(p, add_special_tokens=True)["input_ids"] for p in prompts]
 if any(not ids or len(ids) + generated_tokens >= capacity for ids in prompt_ids):
@@ -95,8 +114,12 @@ report = {
     "gpu": torch.cuda.get_device_name(),
     "capability": list(torch.cuda.get_device_capability()),
     "dtype": str(next(model.parameters()).dtype),
+    "capacity": capacity,
+    "warmups": warmups,
+    "samples": samples,
+    "generated_tokens": generated_tokens,
     "timing_notes": "Synchronized host wall time, with device positions prepared before timing. "
-    "Native eager uses HF's growing cache; other variants use capacity-64 "
+    f"Native eager uses HF's growing cache; other variants use capacity-{capacity} "
     "explicit state. CUDA event spans include device idle gaps from host work.",
     "timings": {},
     "prompts": [],
