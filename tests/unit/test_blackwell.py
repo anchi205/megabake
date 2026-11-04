@@ -164,6 +164,27 @@ def test_sm100_128_thread_variant_rejects_two_accumulator_stages(monkeypatch):
         TABLE_GEMM.table_definition({"symbol": "gemm", "splits": 1}, (128, 8), "", False, 0)
 
 
+@pytest.mark.parametrize("stages", [1, 2])
+def test_sm100_cutlass_fork_is_opt_in_and_requires_256_threads(monkeypatch, stages):
+    from megabake.bodies.cuda.sm100.table import TABLE_GEMM
+
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT", "1")
+    monkeypatch.setenv("MEGABAKE_SM100_CUTLASS_FORK", "1")
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_STAGES", str(stages))
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_WIDTH", "256")
+    definition = TABLE_GEMM.table_definition(
+        {"symbol": "gemm", "splits": 1}, (128, 8), "", False, 0
+    )
+    assert "Sm100CutlassForkGemm" in definition
+    assert f"acc_stages={stages}" in definition
+    assert "Sm100CutlassForkGemm" in TABLE_GEMM.table_import
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_WIDTH", "128")
+    with pytest.raises(ValueError, match="requires 256 threads"):
+        TABLE_GEMM.table_definition({"symbol": "gemm", "splits": 1}, (128, 8), "", False, 0)
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT", "0")
+    assert "Sm100CutlassForkGemm" not in TABLE_GEMM.table_import
+
+
 def test_sm100_persistent_defaults_to_128_thread_variant(monkeypatch):
     from megabake.bodies.cuda.sm100.table import TABLE_GEMM
 
@@ -339,9 +360,14 @@ def test_sm100_tuning_fingerprint_separates_persistent_variants(monkeypatch):
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_WIDTH", "256")
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_STAGES", "2")
     wide = tuning.device_fingerprint(0)
+    monkeypatch.setenv("MEGABAKE_SM100_CUTLASS_FORK", "1")
+    fork = tuning.device_fingerprint(0)
     assert (narrow["persistent_width"], narrow["persistent_acc_stages"]) == (128, 1)
     assert (wide["persistent_width"], wide["persistent_acc_stages"]) == (256, 2)
     assert narrow != wide
+    assert wide["persistent_cutlass_fork"] is False
+    assert fork["persistent_cutlass_fork"] is True
+    assert wide != fork
 
 
 def test_sm100_measured_choice_controls_tile_and_split(monkeypatch):

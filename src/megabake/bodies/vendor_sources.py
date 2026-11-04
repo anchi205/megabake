@@ -28,7 +28,7 @@ def references():
         },
         {
             "original": blackwell / "cutlass_upstream" / "dense_gemm_persistent.py",
-            "adaptation": blackwell / "persistent_gemm.py",
+            "adaptation": blackwell / "cutlass_gemm.py",
             "sha256": "4f3d5fa8c6032c2190933cb43c71d358bb200225fe7c0ec0b54014a9a6235362",
             "header": b"# ruff: noqa\n# fmt: off\n",
         },

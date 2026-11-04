@@ -13,6 +13,126 @@ and the PyTorch graph used for comparison can differ as well. SM90 hardware was
 not tested after the shared compiler and attention changes. Only one SM100 B200
 was tested; the results do not establish support on other Blackwell devices.
 
+## Direct persistent CUTLASS fork on 2026-11-04
+
+`src/megabake/bodies/cuda/sm100/cutlass_gemm.py` retains the pinned upstream
+CUTLASS 4.8.0 persistent GEMM, including its unchanged standalone kernel, and
+adds a MegaBake table entry based on its producer/MMA pipeline. The entry
+adapts scheduling, dynamic descriptors, 8/32-row tiles, split-K and generated
+epilogues. `tools/vendor_cutlass.py --stat` shows the fork against the pinned
+upstream snapshot. The table body uses 256 threads, one CTA and one or two
+accumulator stages; the upstream standalone example uses 192 threads. It is
+experimental and opt-in. The earlier 128-thread path remains available.
+
+The following BF16, batch-one decode comparison uses one B200, cache capacity
+192 and CUDA graphs. Values are synchronized host medians in milliseconds over
+24 calls after five warmups, with device positions prepared before timing.
+The 128-thread and fork results came from separate runs; both used the same
+shape heuristic, split limit 8, supported fusion and no tuning file. The fork
+used one accumulator stage. Small differences may be noise. PyTorch graph
+times are from the fork runs and use static masked attention; the MegaBake
+graphs use their own cache body. Qwen3.5's optional PyTorch acceleration
+packages were not installed.
+
+| Model | PyTorch graph | Existing 128 | CUTLASS fork | Fork change vs 128 | 128 / fork prompts matching native |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| SmolLM 135M | 1.9971 | 1.2768 | 1.2500 | -2.10% | 4/5 / 5/5 |
+| Qwen2 0.5B | 1.7129 | 1.5901 | 1.5727 | -1.10% | 4/5 / 4/5 |
+| Qwen2.5 0.5B Instruct | 1.7094 | 1.5767 | 1.5684 | -0.53% | 3/5 / 3/5 |
+| DeepSeek draft 0.6B | 1.6960 | 1.5822 | 1.5432 | -2.47% | 3/5 / 4/5 |
+| Gemma 3 270M | 1.3379 | 2.3223 | 2.3349 | +0.55% | 4/5 / 3/5 |
+| SmolLM 1.7B | 2.0391 | 1.9767 | 1.9776 | +0.05% | 4/5 / 4/5 |
+| Gemma 2B | 2.0157 | 2.7383 | 2.6499 | -3.23% | 4/5 / 4/5 |
+| Qwen3.5 0.8B | 1.8388 | 4.3415 | 4.6623 | +7.39% | 4/5 / 4/5 |
+
+The prompt counts require all 16 generated tokens to match native eager; they
+do not imply logit equality. All checked logits were finite. Native sequences
+were the same between runs. The fork and 128-thread MegaBake sequences differed
+on one prompt each for SmolLM 135M, Qwen2.5, DeepSeek and Gemma 3. The wider
+launch also changes the thread layout of other phases, so these differences
+cannot be attributed to the GEMM alone.
+
+To control for block width, the same graph benchmark was repeated with the
+previous 256-thread persistent body and the same one-stage settings. Each
+column below comes from a separate run. The fork and previous 256-thread body
+produced the same 16-token sequence on all five sampled prompts for every
+model; this does not establish full-logit equality or equivalence on other
+inputs. These results are consistent with a block-width effect but do not
+prove the cause of the differences from the 128-thread path.
+
+| Model | Existing 256 | CUTLASS fork 256 | Fork change |
+| --- | ---: | ---: | ---: |
+| SmolLM 135M | 1.2656 | 1.2500 | -1.24% |
+| Qwen2 0.5B | 1.5678 | 1.5727 | +0.31% |
+| Qwen2.5 0.5B Instruct | 1.5670 | 1.5684 | +0.09% |
+| DeepSeek draft 0.6B | 1.5544 | 1.5432 | -0.72% |
+| Gemma 3 270M | 2.3383 | 2.3349 | -0.14% |
+| SmolLM 1.7B | 1.9538 | 1.9776 | +1.22% |
+| Gemma 2B | 2.7443 | 2.6499 | -3.44% |
+| Qwen3.5 0.8B | 4.6501 | 4.6623 | +0.26% |
+
+For a separate repeated-token, teacher-forced audit, the next table compares
+SHA-256 hashes of full logit tensors at 128 positions against the 128-thread
+path. Top-token and relative L2 columns compare each run to wrapper eager;
+the relative L2 is the fork's median / maximum over positions. The last column
+compares the two MegaBake paths' 40-token greedy sequences.
+
+| Model | Full logits matching 128 | 128 / fork top matches eager | Fork relative L2 vs eager | 40-token sequences match |
+| --- | ---: | ---: | ---: | --- |
+| SmolLM 135M | 2/128 | 124/128 / 122/128 | 1.39% / 7.06% | yes |
+| Qwen2 0.5B | 7/128 | 127/128 / 127/128 | 1.37% / 3.17% | yes |
+| Qwen2.5 0.5B Instruct | 24/128 | 127/128 / 127/128 | 2.41% / 4.62% | yes |
+| DeepSeek draft 0.6B | 16/128 | 127/128 / 127/128 | 1.82% / 4.58% | yes |
+| Gemma 3 270M | 2/128 | 122/128 / 123/128 | 2.99% / 8.26% | no |
+| SmolLM 1.7B | 17/128 | 126/128 / 125/128 | 0.77% / 2.03% | no |
+| Gemma 2B | 3/128 | 128/128 / 127/128 | 1.48% / 16.09% | yes |
+| Qwen3.5 0.8B | 3/128 | 128/128 / 128/128 | 1.53% / 2.54% | yes |
+
+All checked logits were finite, and each fork run's graph and non-graph cache
+states and logits matched at the checked positions. Matching top tokens or
+sampled sequences does not establish equality for other inputs.
+
+In a separate isolated BF16 GEMM comparison, the following are median
+profiler-recorded GPU kernel times in microseconds over 32 calls. The first two
+columns replay CUDA graphs; PyTorch is eager. All four graph/non-graph output
+versions matched eager exactly on the sampled inputs, and the generated phase
+selected `sm100_tma` with the fork. NVIDIA's standalone kernel does not include
+MegaBake's phase table and dynamic descriptors, so the timings do not isolate
+the device bodies or identify the cause of the gap.
+
+| Rows × features × K | NVIDIA persistent | MegaBake CUTLASS fork | PyTorch eager |
+| --- | ---: | ---: | ---: |
+| 1 × 576 × 1536 | 4.1600 | 11.8400 | 4.6725 |
+| 8 × 576 × 1536 | 4.1920 | 11.8400 | 4.3525 |
+| 32 × 576 × 1536 | 4.2240 | 12.1920 | 4.2080 |
+| 128 × 576 × 1536 | 4.2875 | 12.3360 | 4.3040 |
+| 1 × 1536 × 576 | 3.6800 | 10.9275 | 3.3920 |
+| 32 × 1536 × 576 | 3.7760 | 11.0720 | 3.0720 |
+
+The complete B200 unit and GPU suites reported **375 passed, 37 skipped**.
+Skips include Hopper-only cases. This does not establish Hopper behavior or
+numerical equivalence for all inputs. A separately compiled fork test's PTX
+contains `tcgen05.mma` and TMA tensor loads; its cubin contains `UTCHMMA` and
+`UTMALDG.2D` instructions.
+
+The local raw artifact archive `megabake-cutlass-fork-evaluation-20261104.tar.gz`
+(not included in the PR) has SHA-256
+`a3b75aa4186b07f5cd8283f79a45aa3e42267489cc2e4210d2175ff493cf5287`.
+
+To measure the fork with the graph runner:
+
+```bash
+python tools/benchmark_sm100_graphs.py --models-root "$MODEL_ROOT" \
+  --threads 256 --implementation cutlass-fork --out /tmp/megabake-cutlass-fork
+```
+
+The equivalent code-generation flags are `MEGABAKE_SM100_TCGEN=1`,
+`MEGABAKE_SM100_PERSISTENT=1`, `MEGABAKE_SM100_PERSISTENT_WIDTH=256`, and
+`MEGABAKE_SM100_CUTLASS_FORK=1`. The measured run additionally used
+`MEGABAKE_SM100_TCGEN_TILE=auto`, `MEGABAKE_SM100_EPILOGUE=1` and
+`MEGABAKE_SM100_SPLIT_K=8`. An optional
+`MEGABAKE_SM100_PERSISTENT_STAGES=2` selects two stages.
+
 ## Paired graph comparison on 2026-11-04
 
 The following measurements used code commit `5e3d28a`, one B200, BF16, batch

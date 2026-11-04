@@ -101,6 +101,9 @@ def _sm100_tma_candidate(program, base, target, policy, paired, fused=False):
     persistent = os.environ.get("MEGABAKE_SM100_PERSISTENT") == "1"
     acc_stages = 2 if os.environ.get("MEGABAKE_SM100_PERSISTENT_STAGES") == "2" else 1
     persistent_width = 256 if os.environ.get("MEGABAKE_SM100_PERSISTENT_WIDTH") == "256" else 128
+    cutlass_fork = persistent and os.environ.get("MEGABAKE_SM100_CUTLASS_FORK") == "1"
+    if cutlass_fork and persistent_width != 256:
+        raise ValueError("the CUTLASS persistent fork requires 256 threads")
     if persistent and persistent_width == 128 and acc_stages != 1:
         raise ValueError("the 128-thread persistent variant requires one accumulator stage")
     from ..generic import _layouts
@@ -113,6 +116,7 @@ def _sm100_tma_candidate(program, base, target, policy, paired, fused=False):
             f"sm100_tma_swapab_{token_tile}x{feature_tile}"
             + (f"_persistent{acc_stages}" if persistent else "")
             + ("_w128" if persistent and persistent_width == 128 else "")
+            + ("_fork" if cutlass_fork else "")
             + (f"_k{splits}" if splits > 1 else "")
             + ("_epilogue" if fused else "")
         ),
@@ -128,7 +132,9 @@ def _sm100_tma_candidate(program, base, target, policy, paired, fused=False):
             participating_threads=persistent_width if persistent else 128,
             waiting_threads=persistent_width if persistent else 128,
             warp_roles=(
-                ("epilogue",) * 4 + ("tma", "mma", "idle", "idle")
+                ("epilogue",) * 4
+                + (("mma", "tma") if cutlass_fork else ("tma", "mma"))
+                + ("idle", "idle")
                 if persistent and persistent_width == 256
                 else ("tma_epilogue", "mma_epilogue", "epilogue", "epilogue")
                 if persistent

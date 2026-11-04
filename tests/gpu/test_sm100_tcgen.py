@@ -380,11 +380,18 @@ def test_sm100_tcgen_one_token_decode(monkeypatch, tmp_path):
 @pytest.mark.parametrize("fused", [False, True])
 @pytest.mark.parametrize("splits", [1, 8])
 @pytest.mark.parametrize(
-    ("persistent", "acc_stages", "width"),
-    [(False, 1, 128), (True, 1, 256), (True, 2, 256), (True, 1, 128)],
+    ("persistent", "acc_stages", "width", "fork"),
+    [
+        (False, 1, 128, False),
+        (True, 1, 256, False),
+        (True, 2, 256, False),
+        (True, 1, 128, False),
+        (True, 1, 256, True),
+        (True, 2, 256, True),
+    ],
 )
 def test_sm100_tcgen_multiple_tiles_per_worker(
-    monkeypatch, tmp_path, fused, splits, persistent, acc_stages, width
+    monkeypatch, tmp_path, fused, splits, persistent, acc_stages, width, fork
 ):
     from megabake import compiler, graphed, make_backend
     from megabake.bodies.cuda.sm90.gemm import split_k
@@ -398,6 +405,7 @@ def test_sm100_tcgen_multiple_tiles_per_worker(
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT", "1" if persistent else "0")
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_STAGES", str(acc_stages))
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_WIDTH", str(width))
+    monkeypatch.setenv("MEGABAKE_SM100_CUTLASS_FORK", "1" if fork else "0")
     monkeypatch.setattr(compiler, "_TABLE_LAUNCH_OPS", 0)
     # Model tuning can override the default one-wave split heuristic.
     if splits > 1:
@@ -442,7 +450,8 @@ def test_sm100_tcgen_multiple_tiles_per_worker(
 
 
 @pytest.mark.parametrize("rows,matvec", [(1, True), (6, False)])
-def test_persistent_gemm_with_warp_mma_fallback(monkeypatch, tmp_path, rows, matvec):
+@pytest.mark.parametrize("fork", [False, True])
+def test_persistent_gemm_with_warp_mma_fallback(monkeypatch, tmp_path, rows, matvec, fork):
     from megabake import compiler, graphed, make_backend
 
     monkeypatch.delenv("MEGABAKE_SM100_TUNING_FILE", raising=False)
@@ -450,6 +459,7 @@ def test_persistent_gemm_with_warp_mma_fallback(monkeypatch, tmp_path, rows, mat
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN_TILE", "128")
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT", "1")
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_WIDTH", "256")
+    monkeypatch.setenv("MEGABAKE_SM100_CUTLASS_FORK", "1" if fork else "0")
     monkeypatch.setenv("MEGABAKE_SM100_MATVEC", "1" if matvec else "0")
     monkeypatch.setattr(compiler, "_TABLE_LAUNCH_OPS", 0)
 
@@ -486,9 +496,12 @@ def test_persistent_gemm_with_warp_mma_fallback(monkeypatch, tmp_path, rows, mat
 @pytest.mark.parametrize("rows", [1, 32])
 @pytest.mark.parametrize("fused", [False, True])
 @pytest.mark.parametrize("splits", [1, 8])
-@pytest.mark.parametrize(("width", "acc_stages"), [(256, 1), (256, 2), (128, 1)])
+@pytest.mark.parametrize(
+    ("width", "acc_stages", "fork"),
+    [(256, 1, False), (256, 2, False), (128, 1, False), (256, 1, True), (256, 2, True)],
+)
 def test_persistent_gemm_matches_existing_body(
-    monkeypatch, tmp_path, rows, fused, splits, width, acc_stages
+    monkeypatch, tmp_path, rows, fused, splits, width, acc_stages, fork
 ):
     from megabake import compiler, make_backend
     from megabake.bodies.cuda.sm90.gemm import split_k
@@ -501,6 +514,7 @@ def test_persistent_gemm_matches_existing_body(
     monkeypatch.setenv("MEGABAKE_SM100_EPILOGUE", "1" if fused else "0")
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_STAGES", str(acc_stages))
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_WIDTH", str(width))
+    monkeypatch.setenv("MEGABAKE_SM100_CUTLASS_FORK", "1" if fork else "0")
     monkeypatch.setattr(compiler, "_TABLE_LAUNCH_OPS", 0)
 
     class Gemm(torch.nn.Module):

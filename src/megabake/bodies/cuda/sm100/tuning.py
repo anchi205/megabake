@@ -21,6 +21,7 @@ def _device_details(device_index: int) -> dict:
     files = (
         Path(__file__).with_name("tcgen_gemm.py"),
         Path(__file__).with_name("persistent_gemm.py"),
+        Path(__file__).with_name("cutlass_gemm.py"),
         Path(__file__).with_name("gemm.py"),
         Path(__file__).with_name("table.py"),
         Path(__file__).with_name("__init__.py"),
@@ -79,6 +80,8 @@ def device_fingerprint(device_index: int) -> dict:
         **_device_details(device_index),
         "fused_epilogues": os.environ.get("MEGABAKE_SM100_EPILOGUE") == "1",
         "persistent_gemm": os.environ.get("MEGABAKE_SM100_PERSISTENT") == "1",
+        "persistent_cutlass_fork": os.environ.get("MEGABAKE_SM100_PERSISTENT") == "1"
+        and os.environ.get("MEGABAKE_SM100_CUTLASS_FORK") == "1",
         "persistent_width": 128
         if os.environ.get("MEGABAKE_SM100_PERSISTENT") == "1"
         and os.environ.get("MEGABAKE_SM100_PERSISTENT_WIDTH") != "256"

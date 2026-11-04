@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import subprocess
 import sys
 from importlib.util import module_from_spec, spec_from_file_location
@@ -20,6 +21,26 @@ def test_cutlass_upstream_copy_is_unmodified():
         text=True,
     )
     assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_sm100_persistent_fork_preserves_upstream_kernel():
+    directory = ROOT / "src" / "megabake" / "bodies" / "cuda" / "sm100"
+    original = (directory / "cutlass_upstream" / "dense_gemm_persistent.py").read_text()
+    fork = (directory / "cutlass_gemm.py").read_text()
+
+    def method(source, name):
+        module = ast.parse(source)
+        cls = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.ClassDef) and node.name == "PersistentDenseGemmKernel"
+        )
+        return next(
+            node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == name
+        )
+
+    assert ast.dump(method(original, "kernel")) == ast.dump(method(fork, "kernel"))
+    assert method(fork, "table_kernel")
 
 
 @pytest.mark.parametrize("modify_header", [False, True])

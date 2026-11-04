@@ -45,12 +45,20 @@ def main() -> int:
     parser.add_argument("--models", nargs="+", choices=MODELS, default=list(MODELS))
     parser.add_argument("--threads", type=int, choices=(128, 256), default=128)
     parser.add_argument("--stages", type=int, choices=(1, 2), default=1)
+    parser.add_argument(
+        "--implementation",
+        choices=("existing", "cutlass-fork"),
+        default="existing",
+        help="select the existing body or the experimental direct CUTLASS fork",
+    )
     parser.add_argument("--capacity", type=int, default=192)
     parser.add_argument("--warmups", type=int, default=5)
     parser.add_argument("--samples", type=int, default=24)
     args = parser.parse_args()
     if args.threads == 128 and args.stages != 1:
         parser.error("the 128-thread variant requires one accumulator stage")
+    if args.implementation == "cutlass-fork" and args.threads != 256:
+        parser.error("the experimental CUTLASS fork requires 256 threads")
     if args.warmups < 0 or args.samples < 1 or args.capacity < args.warmups + args.samples:
         parser.error("warmups must be non-negative and capacity must hold all timed samples")
     models = list(dict.fromkeys(args.models))
@@ -79,6 +87,8 @@ def main() -> int:
         "MEGABAKE_SM100_PERSISTENT_STAGES": str(args.stages),
         "MEGABAKE_PREFILL_VALUE_BLOCK": "0",
     }
+    if args.implementation == "cutlass-fork":
+        settings["MEGABAKE_SM100_CUTLASS_FORK"] = "1"
     env.update(settings)
     env.update(
         HF_HUB_OFFLINE="1",
@@ -97,6 +107,7 @@ def main() -> int:
         "models_root": str(models_root),
         "models": models,
         "capacity": args.capacity,
+        "implementation": args.implementation,
         "warmups": args.warmups,
         "samples": args.samples,
         "settings": settings,
