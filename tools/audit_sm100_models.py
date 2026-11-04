@@ -1,9 +1,4 @@
-"""Independently retime decoder variants and check real prompts against native HF.
-
-Run from the MegaBake checkout with its environment and a model's tuning file.
-This uses a separately written timer and the same explicit-cache graph wrappers
-as the original benchmark. Native eager uses Transformers' growing cache.
-"""
+"""Time decoder variants and check prompts against native Hugging Face eager."""
 
 from __future__ import annotations
 

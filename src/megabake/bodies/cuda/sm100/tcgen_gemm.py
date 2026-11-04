@@ -47,7 +47,6 @@ io_dtype = cutlass.BFloat16
 acc_dtype = cutlass.Float32
 threads_per_cta = 128
 
-# Pipeline stage configuration
 ab_stages = 4
 acc_stage = 1
 
@@ -116,7 +115,6 @@ def _run_tcgen_tile(
     mC_mnl = cute.make_tensor(
         cute.make_ptr(io_dtype, c_address, cute.AddressSpace.gmem, assumed_align=16), mC_mnl.layout
     )
-    # Current thread/warp/block coordinates
     tidx, _, _ = cute.arch.thread_idx()
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -126,15 +124,9 @@ def _run_tcgen_tile(
     bidx, bidy = output_tile % feature_tiles, output_tile // feature_tiles
     mma_coord_mnk = (bidx, bidy, None)
 
-    #
-    # 1. Prepare args
-    #
-
-    # Allocate SMEM
     sA = storage.sA.get_tensor(a_smem_layout.outer, swizzle=a_smem_layout.inner)
     sB = storage.sB.get_tensor(b_smem_layout.outer, swizzle=b_smem_layout.inner)
 
-    # Allocate all TMEM columns
     tmem_alloc_barrier = pipeline.NamedBarrier(
         barrier_id=1,
         num_threads=threads_per_cta,
@@ -146,7 +138,6 @@ def _run_tcgen_tile(
     num_tmem_cols = 512
     tmem.allocate(num_tmem_cols)
 
-    # Prefetch tma descriptor
     if warp_idx == 0:
         cpasync.prefetch_descriptor(tma_atom_a)
         cpasync.prefetch_descriptor(tma_atom_b)
@@ -156,7 +147,6 @@ def _run_tcgen_tile(
         # proxy; make those writes visible to the async TMA proxy.
         cute.arch.fence_proxy("async.global")
 
-    # Pipeline configuration
     num_tma_copy_bytes = cute.size_in_bytes(
         io_dtype, cute.select(a_smem_layout, mode=[0, 1, 2])
     ) + cute.size_in_bytes(io_dtype, cute.select(b_smem_layout, mode=[0, 1, 2]))
@@ -177,29 +167,17 @@ def _run_tcgen_tile(
         barrier_storage=storage.acc_mbar_ptr.data_ptr(),
     ).make_participants()
 
-    # Partition tensors for MMA and make fragments
-    # (bM, bK, RestK)
     gA = cute.local_tile(mA_mkl, mma_tiler_mnk, mma_coord_mnk, proj=(1, None, 1))
-    # (bN, bK, RestK)
     gB = cute.local_tile(mB_nkl, mma_tiler_mnk, mma_coord_mnk, proj=(None, 1, 1))
-    # (bM, bN)
     gC = cute.local_tile(mC_mnl, mma_tiler_mnk, mma_coord_mnk, proj=(1, 1, None))
     thr_mma = tiled_mma.get_slice(0)
-    # (MMA, MMA_M, MMA_K)
     tCgA = thr_mma.partition_A(gA)
-    # (MMA, MMA_N, MMA_K)
     tCgB = thr_mma.partition_B(gB)
-    # (MMA, MMA_M, MMA_N)
     tCgC = thr_mma.partition_C(gC)
-    # (MMA, MMA_M, MMA_K)
     tCrA = tiled_mma.make_fragment_A(sA)
-    # (MMA, MMA_N, MMA_K)
     tCrB = tiled_mma.make_fragment_B(sB)
-    # (MMA, MMA_M, MMA_N)
     acc_shape = tiled_mma.partition_shape_C(mma_tiler_mnk[:2])
-    # (MMA, MMA_M, MMA_N)
     tCtAcc = tiled_mma.make_fragment_C(acc_shape)
-    # Partition tensors for TMA; This requires the tensors partitioned for MMA
     tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
         tma_atom_a,
         0,
@@ -215,22 +193,16 @@ def _run_tcgen_tile(
         cute.group_modes(tCgB, 0, 3),
     )
 
-    # CTA-wide sync before retrieving the pointer to the start of the allocated TMEM
-    # Only warp 0 does the allocation so we need to sync before retrieving the TMEM start address
+    # Wait for warp 0's TMEM allocation before retrieving its pointer.
     tmem.wait_for_alloc()
     tmem_ptr = tmem.retrieve_ptr(acc_dtype)
-    # Swap the pointer in tCtAcc
     tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc.layout)
 
     subtile_cnt = 1 if cutlass.const_expr(feature_tile == 64) else 4
-    # (EpiTile)
     epi_tiler = ((cute.size(tCtAcc, mode=[0, 0]), cute.size(tCtAcc, mode=[0, 1]) // subtile_cnt),)
-    # (EpiTile, NumTiles)
     tCtAcc_epi = cute.zipped_divide(tCtAcc, epi_tiler)
-    # (EpiTile, NumTiles)
     gC_epi = cute.zipped_divide(tCgC, epi_tiler)
 
-    # Use a TMEM copy layout suited to the selected feature tile.
     if cutlass.const_expr(feature_tile == 64):
         tmem_atom = cute.make_copy_atom(tcgen05.Ld16x256bOp(tcgen05.Repetition.x1), cutlass.Float32)
     else:
@@ -238,9 +210,7 @@ def _run_tcgen_tile(
     tmem_tiled_copy = tcgen05.make_tmem_copy(tmem_atom, tCtAcc_epi[None, 0])
     tmem_thr_copy = tmem_tiled_copy.get_slice(tidx)
 
-    # (TmemCpy,NumTmemCpy,NumTiles)
     tDtC = tmem_thr_copy.partition_S(tCtAcc_epi)
-    # (TmemCpy,NumTmemCpy,NumTiles)
     tDgC = tmem_thr_copy.partition_D(gC_epi)
     identity = cute.make_identity_tensor(mC_mnl.shape)
     gCoord = cute.local_tile(identity, mma_tiler_mnk, mma_coord_mnk, proj=(1, 1, None))
@@ -248,14 +218,9 @@ def _run_tcgen_tile(
     gCoord_epi = cute.zipped_divide(tCgCoord, epi_tiler)
     tDgCoord = tmem_thr_copy.partition_D(gCoord_epi)
 
-    # (TmemCpy,NumTmemCpy)
     tCrAcc = cute.make_rmem_tensor(tDgC[None, None, 0].shape, acc_dtype)
-    # (TmemCpy,NumTmemCpy)
     tCrC = cute.make_rmem_tensor(tDgC[None, None, 0].shape, io_dtype)
 
-    #
-    # 2. Main loop
-    #
     num_k_tiles = cute.size(gA, mode=[2]) // splits
     k_start = split_index * num_k_tiles
     if cutlass.const_expr(warp_specialized):
@@ -291,10 +256,8 @@ def _run_tcgen_tile(
             acc_empty.commit()
     else:
         if warp_idx == 0:
-            # Wait for a empty accumulator buffer
             acc_empty = acc_producer.acquire_and_advance()
             for k_tile_idx in cutlass.range(num_k_tiles, prefetch_stages=ab_stages - 2):
-                # Issue TMA loads
                 ab_empty = ab_producer.acquire_and_advance()
                 cute.copy(
                     tma_atom_a,
@@ -311,7 +274,6 @@ def _run_tcgen_tile(
                     tma_desc_ptr=desc_b,
                 )
 
-                # Execute one K-block worth of MMA instructions
                 ab_full = ab_consumer.wait_and_advance()
                 num_k_blocks = cute.size(tCrA, mode=[2])
                 for k_block_idx in cutlass.range_constexpr(num_k_blocks):
@@ -325,22 +287,15 @@ def _run_tcgen_tile(
                     )
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
-                # Signal that the A/B buffers have been consumed and are ready for the next load
                 ab_full.release()
 
-            # Signal that the accumulator is fully computed
             acc_empty.commit()
-
-    #
-    # 3. Epilogue
-    #
 
     # The specialized load warp can finish before the MMA warp. Keep its
     # allocation permit until the accumulator is complete in that variant.
     if cutlass.const_expr(not warp_specialized):
         tmem.relinquish_alloc_permit()
 
-    # Wait for the accumulator buffer to be full
     acc_full = acc_consumer.wait_and_advance()
     if cutlass.const_expr(warp_specialized):
         tmem.relinquish_alloc_permit()
@@ -425,7 +380,6 @@ def _run_tcgen_tile(
                 )
     acc_full.release()
 
-    # Deallocate TMEM
     pipeline.sync(barrier_id=1)
     tmem.free(tmem_ptr)
 

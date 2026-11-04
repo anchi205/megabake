@@ -59,9 +59,7 @@ def _sm100_tma_candidate(program, base, target, policy, paired, fused=False):
     left_strides = dict(zip(left.axes, left.strides, strict=True))
     right_strides = dict(zip(right.axes, right.strides, strict=True))
     tile_setting = os.environ.get("MEGABAKE_SM100_TCGEN_TILE", "auto")
-    # Some model projections are multiples of 64 but not 128. Allow those
-    # phases to use the tensor-core path while preserving 128-feature tiles
-    # for the other projections. This is a shape-based choice, not tuning.
+    # Use 64-feature tiles for projections that are not multiples of 128.
     feature_tile = (
         64 if tile_setting == "64" or (tile_setting == "auto" and columns % 128 != 0) else 128
     )
@@ -87,8 +85,7 @@ def _sm100_tma_candidate(program, base, target, policy, paired, fused=False):
     split_setting = os.environ.get("MEGABAKE_SM100_SPLIT_K", "8")
     split_limit = int(split_setting) if split_setting in {"2", "4", "8"} else 1
     output_tiles = ((rows + token_tile - 1) // token_tile) * (columns // feature_tile)
-    # Do not create a second wave of split tiles. Large projections such as
-    # the language-model head already have enough parallelism without split-K.
+    # Avoid creating a second wave of split tiles.
     splits = 1
     for count in (2, 4, 8):
         if (
@@ -345,10 +342,7 @@ class BlackwellGemmProvider:
         # tokens. Keep it an explicit experiment until wider model validation.
         if not paired and os.environ.get("MEGABAKE_SM100_MATVEC") != "1":
             return CandidateSet((tma, mma) if tma is not None else (mma,), ())
-        # A single decode token leaves 15 of 16 MMA rows empty.  On SM100,
-        # give each warp several output columns and reduce over K instead.
-        # This path is restricted to contiguous K weights and has been
-        # exercised on SM100; other Blackwell targets keep the existing body.
+        # Use warp reductions for short rows with contiguous K weights.
         contiguous_k = right.strides[right.axes.index("r0")] == 1
         rows = program.store.shape[0]
         if (
