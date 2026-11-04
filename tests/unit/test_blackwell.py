@@ -121,12 +121,13 @@ def test_sm100_short_row_candidates_respect_rows_and_architecture(monkeypatch, r
 @pytest.mark.parametrize(
     "persistent,stages,width", [(False, 1, 128), (True, 1, 256), (True, 2, 256), (True, 1, 128)]
 )
-def test_sm100_persistent_contract_is_opt_in(monkeypatch, persistent, stages, width):
+def test_sm100_persistent_contract_variants(monkeypatch, persistent, stages, width):
     from megabake.bodies.cuda.sm100.table import TABLE_GEMM
 
     monkeypatch.delenv("MEGABAKE_SM100_TUNING_FILE", raising=False)
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT", "1" if persistent else "0")
+    monkeypatch.setenv("MEGABAKE_SM100_CUTLASS_FORK", "0")
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_STAGES", str(stages))
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_WIDTH", str(width))
     region = next(
@@ -165,7 +166,7 @@ def test_sm100_128_thread_variant_rejects_two_accumulator_stages(monkeypatch):
 
 
 @pytest.mark.parametrize("stages", [1, 2])
-def test_sm100_cutlass_fork_is_opt_in_and_requires_256_threads(monkeypatch, stages):
+def test_sm100_cutlass_fork_requires_256_threads(monkeypatch, stages):
     from megabake.bodies.cuda.sm100.table import TABLE_GEMM
 
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT", "1")
@@ -185,12 +186,13 @@ def test_sm100_cutlass_fork_is_opt_in_and_requires_256_threads(monkeypatch, stag
     assert "Sm100CutlassForkGemm" not in TABLE_GEMM.table_import
 
 
-def test_sm100_persistent_defaults_to_128_thread_variant(monkeypatch):
+def test_sm100_persistent_defaults_to_cutlass_fork(monkeypatch):
     from megabake.bodies.cuda.sm100.table import TABLE_GEMM
 
     monkeypatch.delenv("MEGABAKE_SM100_TUNING_FILE", raising=False)
-    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT", "1")
-    monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
+    monkeypatch.delenv("MEGABAKE_SM100_PERSISTENT", raising=False)
+    monkeypatch.delenv("MEGABAKE_SM100_TCGEN", raising=False)
+    monkeypatch.delenv("MEGABAKE_SM100_CUTLASS_FORK", raising=False)
     monkeypatch.delenv("MEGABAKE_SM100_PERSISTENT_WIDTH", raising=False)
     monkeypatch.delenv("MEGABAKE_SM100_PERSISTENT_STAGES", raising=False)
     region = next(
@@ -208,15 +210,15 @@ def test_sm100_persistent_defaults_to_128_thread_variant(monkeypatch):
         SelectionPolicy(mode="decode", table_launch=True),
     )
     body = next(c for c in candidates.configurations if c.provider == "sm100_tma")
-    assert body.participants.participating_threads == 128
+    assert body.participants.participating_threads == 256
     definition = TABLE_GEMM.table_definition(
         {"symbol": "gemm", "splits": 1}, (128, 8), "", False, 0
     )
-    assert "Sm100TmaGemm" in definition and "warp_specialized=True" in definition
+    assert "Sm100CutlassForkGemm" in definition and "acc_stages=1" in definition
 
 
 @pytest.mark.parametrize("tile", ["64", "128"])
-def test_sm100_tcgen_is_opt_in_and_respects_policy(monkeypatch, tile):
+def test_sm100_tcgen_is_default_and_respects_policy(monkeypatch, tile):
     region = next(
         r
         for r in _regions(
@@ -230,6 +232,11 @@ def test_sm100_tcgen_is_opt_in_and_respects_policy(monkeypatch, tile):
     target = _target(architecture="sm100", supports_wgmma=False)
     policy = SelectionPolicy(mode="prefill", table_launch=True)
     monkeypatch.delenv("MEGABAKE_SM100_TCGEN", raising=False)
+    assert any(
+        c.provider == "sm100_tma"
+        for c in provider.get_candidates(region, target, policy).configurations
+    )
+    monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "0")
     assert not any(
         c.provider == "sm100_tma"
         for c in provider.get_candidates(region, target, policy).configurations
@@ -354,6 +361,7 @@ def test_sm100_tuning_fingerprint_separates_persistent_variants(monkeypatch):
 
     monkeypatch.setattr(tuning, "_device_details", lambda index: {"name": "test device"})
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT", "1")
+    monkeypatch.setenv("MEGABAKE_SM100_CUTLASS_FORK", "0")
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_WIDTH", "128")
     monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT_STAGES", "1")
     narrow = tuning.device_fingerprint(0)

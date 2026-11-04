@@ -552,11 +552,12 @@ def test_persistent_gemm_matches_existing_body(
     torch.testing.assert_close(results[1], results[0], atol=0, rtol=0)
 
 
-def test_sm100_persistent_default_runs_128_threads(monkeypatch, tmp_path):
+def test_sm100_persistent_default_runs_cutlass_fork(monkeypatch, tmp_path):
     from megabake import compiler, make_backend
 
-    monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
-    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT", "1")
+    monkeypatch.delenv("MEGABAKE_SM100_TCGEN", raising=False)
+    monkeypatch.delenv("MEGABAKE_SM100_PERSISTENT", raising=False)
+    monkeypatch.delenv("MEGABAKE_SM100_CUTLASS_FORK", raising=False)
     monkeypatch.delenv("MEGABAKE_SM100_PERSISTENT_WIDTH", raising=False)
     monkeypatch.delenv("MEGABAKE_SM100_PERSISTENT_STAGES", raising=False)
     monkeypatch.delenv("MEGABAKE_SM100_TUNING_FILE", raising=False)
@@ -580,9 +581,9 @@ def test_sm100_persistent_default_runs_128_threads(monkeypatch, tmp_path):
         torch.testing.assert_close(compiled(*args), model(*args), atol=0.01, rtol=0.03)
     plan = backend.megabake_last_compiled.plan
     body = next(phase.body for phase in plan.phases if phase.body.provider == "sm100_tma")
-    assert body.participants.participating_threads == 128
-    assert "_persistent1_w128" in body.name
-    assert "warp_specialized=True" in backend.megabake_last_compiled.generated.source
+    assert body.participants.participating_threads == 256
+    assert "_persistent1_fork" in body.name
+    assert "Sm100CutlassForkGemm" in backend.megabake_last_compiled.generated.source
 
 
 def test_sm100_event_scheduler_uses_fallback_gemm(monkeypatch, tmp_path):

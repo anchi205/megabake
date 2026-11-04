@@ -1,4 +1,4 @@
-"""Blackwell GEMM bodies, including experimental SM100 short-row paths."""
+"""Blackwell GEMM bodies, including the SM100 short-row path."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from ...interface import (
     widened_participants,
 )
 from ..generic import GeneratedContractionBody, generic_config
+from .config import persistent_gemm_settings
 
 BLACKWELL_ARCHITECTURES = frozenset({"sm100", "sm103", "sm120", "sm121"})
 
@@ -33,7 +34,7 @@ class BlackwellLaunchOptions:
 
 
 def _sm100_tma_candidate(program, base, target, policy, paired, fused=False):
-    """Return the experimental short-row body when its contracts hold."""
+    """Return the short-row body when its contracts hold."""
     mode_enabled = policy.mode == "prefill" or (
         policy.mode == "decode" and os.environ.get("MEGABAKE_SM100_TCGEN_DECODE", "1") != "0"
     )
@@ -41,7 +42,7 @@ def _sm100_tma_candidate(program, base, target, policy, paired, fused=False):
         paired
         or target.architecture != "sm100"
         or not target.supports_tma
-        or os.environ.get("MEGABAKE_SM100_TCGEN") != "1"
+        or os.environ.get("MEGABAKE_SM100_TCGEN", "1") != "1"
         or (
             isinstance(policy.target_options, BlackwellLaunchOptions)
             and not policy.target_options.tma_gemm
@@ -57,7 +58,7 @@ def _sm100_tma_candidate(program, base, target, policy, paired, fused=False):
     left, right = program.loads[:2]
     left_strides = dict(zip(left.axes, left.strides, strict=True))
     right_strides = dict(zip(right.axes, right.strides, strict=True))
-    tile_setting = os.environ.get("MEGABAKE_SM100_TCGEN_TILE", "128")
+    tile_setting = os.environ.get("MEGABAKE_SM100_TCGEN_TILE", "auto")
     # Some model projections are multiples of 64 but not 128. Allow those
     # phases to use the tensor-core path while preserving 128-feature tiles
     # for the other projections. This is a shape-based choice, not tuning.
@@ -83,7 +84,7 @@ def _sm100_tma_candidate(program, base, target, policy, paired, fused=False):
         or program.store.strides != (columns, 1)
     ):
         return None
-    split_setting = os.environ.get("MEGABAKE_SM100_SPLIT_K", "1")
+    split_setting = os.environ.get("MEGABAKE_SM100_SPLIT_K", "8")
     split_limit = int(split_setting) if split_setting in {"2", "4", "8"} else 1
     output_tiles = ((rows + token_tile - 1) // token_tile) * (columns // feature_tile)
     # Do not create a second wave of split tiles. Large projections such as
@@ -98,14 +99,13 @@ def _sm100_tma_candidate(program, base, target, policy, paired, fused=False):
             splits = count
     if measured is not None:
         splits = measured[1]
-    persistent = os.environ.get("MEGABAKE_SM100_PERSISTENT") == "1"
-    acc_stages = 2 if os.environ.get("MEGABAKE_SM100_PERSISTENT_STAGES") == "2" else 1
-    persistent_width = 256 if os.environ.get("MEGABAKE_SM100_PERSISTENT_WIDTH") == "256" else 128
-    cutlass_fork = persistent and os.environ.get("MEGABAKE_SM100_CUTLASS_FORK") == "1"
-    if cutlass_fork and persistent_width != 256:
-        raise ValueError("the CUTLASS persistent fork requires 256 threads")
-    if persistent and persistent_width == 128 and acc_stages != 1:
-        raise ValueError("the 128-thread persistent variant requires one accumulator stage")
+    settings = persistent_gemm_settings()
+    persistent, persistent_width, acc_stages, cutlass_fork = (
+        settings.enabled,
+        settings.width,
+        settings.stages,
+        settings.cutlass_fork,
+    )
     from ..generic import _layouts
 
     return replace(
@@ -264,7 +264,8 @@ class BlackwellGemmProvider:
             len(program.loads) != 2 or program.post != Cast(acc, dtype, "round_nearest_even")
         )
         if fused:
-            if os.environ.get("MEGABAKE_SM100_EPILOGUE") != "1":
+            epilogue_default = "1" if target.architecture == "sm100" else "0"
+            if os.environ.get("MEGABAKE_SM100_EPILOGUE", epilogue_default) != "1":
                 return reject("experimental SM100 fused epilogue is disabled")
             from ..sm90.gemm import HopperLaunchOptions, _epilogue_rejection
 

@@ -1,6 +1,6 @@
 """SM100 GEMM launch and code-generation contract."""
 
-import os
+from .config import persistent_gemm_settings
 
 
 class Sm100TableGemm:
@@ -22,10 +22,7 @@ class Sm100TableGemm:
             "from megabake.bodies.cuda.sm100.persistent_gemm import Sm100PersistentGemm\n"
             "from megabake.bodies.cuda.sm90.gemm import table_descriptors\n"
         )
-        if (
-            os.environ.get("MEGABAKE_SM100_PERSISTENT") == "1"
-            and os.environ.get("MEGABAKE_SM100_CUTLASS_FORK") == "1"
-        ):
+        if persistent_gemm_settings().cutlass_fork:
             imports += "from megabake.bodies.cuda.sm100.cutlass_gemm import Sm100CutlassForkGemm\n"
         return imports
 
@@ -33,11 +30,13 @@ class Sm100TableGemm:
         raise ValueError("this GEMM body requires a cooperative phase-table launch")
 
     def table_definition(self, spec, tile, epilogues, streaming, stream_stages):
-        persistent = os.environ.get("MEGABAKE_SM100_PERSISTENT") == "1"
-        width = 256 if os.environ.get("MEGABAKE_SM100_PERSISTENT_WIDTH") == "256" else 128
-        cutlass_fork = persistent and os.environ.get("MEGABAKE_SM100_CUTLASS_FORK") == "1"
-        if cutlass_fork and width != 256:
-            raise ValueError("the CUTLASS persistent fork requires 256 threads")
+        settings = persistent_gemm_settings()
+        persistent, width, stages, cutlass_fork = (
+            settings.enabled,
+            settings.width,
+            settings.stages,
+            settings.cutlass_fork,
+        )
         symbol = (
             "Sm100TmaGemm"
             if persistent and width == 128
@@ -47,9 +46,6 @@ class Sm100TableGemm:
             if persistent
             else "Sm100TmaGemm"
         )
-        stages = 2 if os.environ.get("MEGABAKE_SM100_PERSISTENT_STAGES") == "2" else 1
-        if persistent and width == 128 and stages != 1:
-            raise ValueError("the 128-thread persistent variant requires one accumulator stage")
         return (
             f"{spec['symbol']} = {symbol}({tile[0]}, {spec['splits']}, {tile[1]}"
             + (f", acc_stages={stages}" if persistent and width == 256 else "")
@@ -59,12 +55,13 @@ class Sm100TableGemm:
         )
 
     def source_object(self):
-        if os.environ.get("MEGABAKE_SM100_PERSISTENT") == "1":
-            if os.environ.get("MEGABAKE_SM100_CUTLASS_FORK") == "1":
+        settings = persistent_gemm_settings()
+        if settings.enabled:
+            if settings.cutlass_fork:
                 from .cutlass_gemm import PersistentDenseGemmKernel
 
                 return PersistentDenseGemmKernel.table_kernel
-            if os.environ.get("MEGABAKE_SM100_PERSISTENT_WIDTH") != "256":
+            if settings.width == 128:
                 from .tcgen_gemm import _run_tcgen_tile
 
                 return _run_tcgen_tile

@@ -43,22 +43,27 @@ def main() -> int:
     )
     parser.add_argument("--out", type=Path, required=True, help="new or empty results directory")
     parser.add_argument("--models", nargs="+", choices=MODELS, default=list(MODELS))
-    parser.add_argument("--threads", type=int, choices=(128, 256), default=128)
+    parser.add_argument("--threads", type=int, choices=(128, 256))
     parser.add_argument("--stages", type=int, choices=(1, 2), default=1)
     parser.add_argument(
         "--implementation",
-        choices=("existing", "cutlass-fork"),
-        default="existing",
-        help="select the existing body or the experimental direct CUTLASS fork",
+        choices=("default", "warp-mma", "existing", "cutlass-fork"),
+        default="default",
+        help="benchmark the unconfigured default or an explicit persistent variant",
     )
     parser.add_argument("--capacity", type=int, default=192)
     parser.add_argument("--warmups", type=int, default=5)
     parser.add_argument("--samples", type=int, default=24)
     args = parser.parse_args()
-    if args.threads == 128 and args.stages != 1:
+    if args.implementation in {"default", "warp-mma"} and (
+        args.threads is not None or args.stages != 1
+    ):
+        parser.error("--threads and --stages require an explicit persistent implementation")
+    threads = args.threads or (128 if args.implementation == "existing" else 256)
+    if threads == 128 and args.stages != 1:
         parser.error("the 128-thread variant requires one accumulator stage")
-    if args.implementation == "cutlass-fork" and args.threads != 256:
-        parser.error("the experimental CUTLASS fork requires 256 threads")
+    if args.implementation == "cutlass-fork" and threads != 256:
+        parser.error("the CUTLASS fork requires 256 threads")
     if args.warmups < 0 or args.samples < 1 or args.capacity < args.warmups + args.samples:
         parser.error("warmups must be non-negative and capacity must hold all timed samples")
     models = list(dict.fromkeys(args.models))
@@ -71,24 +76,26 @@ def main() -> int:
         parser.error(f"results directory must be new or empty: {out}")
     out.mkdir(parents=True, exist_ok=True)
 
-    # Ignore inherited MegaBake tuning/architecture flags so both thread
-    # options have the documented shape heuristic and no tuning file.
+    # Ignore inherited MegaBake settings for a reproducible default or variant.
     env = {key: value for key, value in os.environ.items() if not key.startswith("MEGABAKE_")}
-    settings = {
-        "MEGABAKE_SM100_TCGEN": "1",
-        "MEGABAKE_SM100_TCGEN_DECODE": "1",
-        "MEGABAKE_SM100_TCGEN_TILE": "auto",
-        "MEGABAKE_SM100_TCGEN_MAX_ROWS": "32",
-        "MEGABAKE_SM100_TOKEN_TILE": "8",
-        "MEGABAKE_SM100_SPLIT_K": "8",
-        "MEGABAKE_SM100_EPILOGUE": "1",
-        "MEGABAKE_SM100_PERSISTENT": "1",
-        "MEGABAKE_SM100_PERSISTENT_WIDTH": str(args.threads),
-        "MEGABAKE_SM100_PERSISTENT_STAGES": str(args.stages),
-        "MEGABAKE_PREFILL_VALUE_BLOCK": "0",
-    }
-    if args.implementation == "cutlass-fork":
-        settings["MEGABAKE_SM100_CUTLASS_FORK"] = "1"
+    settings = {}
+    if args.implementation == "warp-mma":
+        settings = {"MEGABAKE_SM100_TCGEN": "0"}
+    elif args.implementation != "default":
+        settings = {
+            "MEGABAKE_SM100_TCGEN": "1",
+            "MEGABAKE_SM100_TCGEN_DECODE": "1",
+            "MEGABAKE_SM100_TCGEN_TILE": "auto",
+            "MEGABAKE_SM100_TCGEN_MAX_ROWS": "32",
+            "MEGABAKE_SM100_TOKEN_TILE": "8",
+            "MEGABAKE_SM100_SPLIT_K": "8",
+            "MEGABAKE_SM100_EPILOGUE": "1",
+            "MEGABAKE_SM100_PERSISTENT": "1",
+            "MEGABAKE_SM100_PERSISTENT_WIDTH": str(threads),
+            "MEGABAKE_SM100_PERSISTENT_STAGES": str(args.stages),
+            "MEGABAKE_SM100_CUTLASS_FORK": "1" if args.implementation == "cutlass-fork" else "0",
+            "MEGABAKE_PREFILL_VALUE_BLOCK": "0",
+        }
     env.update(settings)
     env.update(
         HF_HUB_OFFLINE="1",

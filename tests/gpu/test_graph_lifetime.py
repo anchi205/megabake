@@ -17,7 +17,7 @@ def test_graphed_keeps_compiled_callable_alive(monkeypatch, tmp_path):
 
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
     monkeypatch.delenv("MEGABAKE_SM100_TUNING_FILE", raising=False)
-    monkeypatch.delenv("MEGABAKE_SM100_PERSISTENT", raising=False)
+    monkeypatch.setenv("MEGABAKE_SM100_PERSISTENT", "0")
     monkeypatch.setattr(compiler, "_TABLE_LAUNCH_OPS", 0)
 
     class Gemm(torch.nn.Module):

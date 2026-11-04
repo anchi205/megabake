@@ -1,4 +1,4 @@
-"""Blackwell (SM10x/SM12x): a warp-MMA GEMM baseline."""
+"""Blackwell bodies: SM100 CUTLASS GEMM and warp-MMA fallback."""
 
 from ...interface import Generation
 from ..sm90.attention import AttentionBodyProvider
