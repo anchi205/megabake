@@ -3,6 +3,7 @@ those of the GPU generation its architecture belongs to."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 from ..graph import ComputeGraph, Region
@@ -22,7 +23,14 @@ from .interface import (
 )
 
 GENERIC: tuple[BodyProvider, ...] = (GenericBodyProvider(),)
-GENERATIONS: tuple[Generation, ...] = (sm90.GENERATION, sm100.GENERATION)
+GENERATIONS: tuple[Generation, ...] = (
+    replace(
+        sm90.GENERATION,
+        target_aliases={"sm90": "sm90a"},
+        supports_wgmma=True,
+    ),
+    sm100.GENERATION,
+)
 
 
 def generation(target: TargetFacts) -> Generation | None:
@@ -53,8 +61,25 @@ def table_gemm(name: str) -> TableGemmProvider | None:
     )
 
 
+def is_table_gemm(name: str) -> bool:
+    """Recognize the original Hopper GEMM and registered table implementations."""
+    return name == sm90.G0RangeBodyProvider.provider_name or table_gemm(name) is not None
+
+
 def supported_architecture(architecture: str) -> bool:
     return any(architecture in found.architectures for found in GENERATIONS)
+
+
+def tuner_for_device():
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("tuning requires a CUDA device")
+    target = cuda_target(torch.cuda.get_device_properties(torch.cuda.current_device()))
+    found = generation(target)
+    if found is None or found.tuner is None:
+        raise RuntimeError(f"no tuning provider for {target.architecture}")
+    return found.tuner
 
 
 def cuda_target(properties: Any) -> TargetFacts:

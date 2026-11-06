@@ -18,7 +18,7 @@ import torch
 from torch.utils import _pytree as pytree
 
 from .bodies import SelectionPolicy, TargetFacts
-from .bodies.catalog import cuda_target, launch_options, table_gemm
+from .bodies.catalog import cuda_target, is_table_gemm, launch_options
 from .bodies.gemm import TABLE_DESCRIPTORS_PER_GEMM, cute_gemm_tensors, is_swap_ab
 from .cache import PlanCache, make_plan_key
 from .codegen import GEMM_SECOND_A_COLUMN, GeneratedCuTeModule, emit_cute
@@ -2047,7 +2047,7 @@ class _RuntimeState:
         g0_tensors = tuple(
             _g0_operands(phase.body, selected, plan.graph, input_tensors, values)
             for phase in plan.phases
-            if table_gemm(phase.body.provider) is not None
+            if is_table_gemm(phase.body.provider)
             and (not table_launch or phase.index in template_phases)
             for selected in plan.selection.selections
             if selected.region_id == phase.region_id

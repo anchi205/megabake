@@ -59,7 +59,6 @@ def _sm100_tma_candidate(program, base, target, policy, paired, fused=False):
     left_strides = dict(zip(left.axes, left.strides, strict=True))
     right_strides = dict(zip(right.axes, right.strides, strict=True))
     tile_setting = os.environ.get("MEGABAKE_SM100_TCGEN_TILE", "auto")
-    # Use 64-feature tiles for projections that are not multiples of 128.
     feature_tile = (
         64 if tile_setting == "64" or (tile_setting == "auto" and columns % 128 != 0) else 128
     )
@@ -169,6 +168,42 @@ def _sm100_tma_candidate(program, base, target, policy, paired, fused=False):
     )
 
 
+def _epilogue_rejection(program, policy):
+    from ....ir import AxisAffine
+    from ...gemm import epilogue_loads, epilogue_source, paired_contraction
+    from ..generic import UnsupportedMapBody
+
+    if not policy.table_launch:
+        return "fused epilogues require a table launch"
+    if paired_contraction(program):
+        first, second = program.loads[1:3]
+        if (first.axes, first.strides, first.dtype, first.source_shape) != (
+            second.axes,
+            second.strides,
+            second.dtype,
+            second.source_shape,
+        ):
+            return "paired operands must share one layout"
+    for load in epilogue_loads(program):
+        for axis in load.axes:
+            references = (
+                (axis,)
+                if isinstance(axis, str)
+                else tuple(term.axis for term in axis.terms)
+                if isinstance(axis, AxisAffine)
+                else ()
+                if isinstance(axis, int)
+                else None
+            )
+            if references is None or not set(references) <= {"o0", "o1"}:
+                return "epilogue operands must be indexed by the output coordinates"
+    try:
+        epilogue_source(program, "_epilogue")
+    except UnsupportedMapBody as error:
+        return f"epilogue expression is not supported: {error}"
+    return None
+
+
 class BlackwellGemmProvider:
     provider_name = "blackwell_mma"
 
@@ -264,11 +299,7 @@ class BlackwellGemmProvider:
             epilogue_default = "1" if target.architecture == "sm100" else "0"
             if os.environ.get("MEGABAKE_SM100_EPILOGUE", epilogue_default) != "1":
                 return reject("experimental SM100 fused epilogue is disabled")
-            from ..sm90.gemm import HopperLaunchOptions, _epilogue_rejection
-
-            reason = _epilogue_rejection(
-                program, replace(policy, target_options=HopperLaunchOptions(swap_ab=True))
-            )
+            reason = _epilogue_rejection(program, policy)
             if reason is not None:
                 return reject(reason)
         if paired:
@@ -342,7 +373,6 @@ class BlackwellGemmProvider:
         # tokens. Keep it an explicit experiment until wider model validation.
         if not paired and os.environ.get("MEGABAKE_SM100_MATVEC") != "1":
             return CandidateSet((tma, mma) if tma is not None else (mma,), ())
-        # Use warp reductions for short rows with contiguous K weights.
         contiguous_k = right.strides[right.axes.index("r0")] == 1
         rows = program.store.shape[0]
         if (

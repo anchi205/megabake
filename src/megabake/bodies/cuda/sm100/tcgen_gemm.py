@@ -41,7 +41,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import cute, pipeline, utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from megabake.bodies.cuda.sm90.gemm import table_descriptor
+from .descriptors import table_descriptor
 
 io_dtype = cutlass.BFloat16
 acc_dtype = cutlass.Float32

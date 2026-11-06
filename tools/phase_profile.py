@@ -8,6 +8,7 @@ therefore approximate, while interval totals are exact.
 
     .venv/bin/python tools/phase_profile.py --model HuggingFaceTB/SmolLM-1.7B --mode prefill
     .venv/bin/python tools/phase_profile.py --mode decode --skip-accuracy-gate
+    .venv/bin/python tools/phase_profile.py --tune-model --model HuggingFaceTB/SmolLM-1.7B --out tuning.json
 
 With --cta every CTA also stamps when its work in each phase is done and when
 it leaves the phase's barrier, which splits each barrier interval into the
@@ -39,6 +40,7 @@ from megabake import (
     compiler,
     make_backend,
 )
+from megabake.bodies.catalog import is_table_gemm, tuner_for_device
 from megabake.runtime import (
     CTA_TIMER_STRIDE,
     GRID_TIMER_SLOTS,
@@ -69,7 +71,7 @@ class _DecodeStepRunner:
 
 def _category(phase) -> str:
     name = re.sub(r"_\d+x\d+$", "", phase.body.name)
-    if phase.body.tiles.mma_family == "wgmma":
+    if phase.body.tiles.mma_family is not None:
         return f"{name} (tensor-core GEMM)"
     kind = phase.region_id.rsplit(":", 1)[-1]
     if kind.startswith(("mm", "bmm", "addmm")) or kind in name:
@@ -170,8 +172,8 @@ def cta_profile(callable_, compiled, run, calls: int) -> dict:
             "barrier": barriers[index],
         }
         program = programs.get(phase.region_id)
-        if phase.body.provider == "sm100_tma" and program is not None:
-            from megabake.bodies.cuda.sm90.gemm import split_k
+        if is_table_gemm(phase.body.provider) and program is not None:
+            from megabake.bodies.gemm import split_k
 
             reduction = next(
                 domain.size
@@ -258,7 +260,7 @@ def profile(callable_, compiled, run, calls: int) -> dict:
             counts[_category(phase)] += 1
     total = sum(duration for duration, _ in intervals)
     gemm_tiles = collections.Counter(
-        len(phase.work_items) for phase in phases if phase.body.tiles.mma_family == "wgmma"
+        len(phase.work_items) for phase in phases if phase.body.tiles.mma_family is not None
     )
     return {
         "workers": compiled.plan.launch.grid_size,
@@ -293,6 +295,12 @@ def main() -> None:
     parser.add_argument("--attention", choices=("eager", "megabake"), default="eager")
     parser.add_argument("--capacity", type=int, default=128)
     parser.add_argument("--calls", type=int, default=9)
+    parser.add_argument("--tune-model", action="store_true", help="sweep GEMM choices for decode")
+    parser.add_argument("--profile-timeout", type=int, default=480)
+    parser.add_argument("--tiles", nargs="+", choices=("auto", "64", "128"), default=("64", "128"))
+    parser.add_argument(
+        "--split-limits", nargs="+", choices=("1", "2", "4", "8"), default=("1", "2", "4", "8")
+    )
     parser.add_argument("--out", type=Path)
     parser.add_argument(
         "--cta", action="store_true", help="also split intervals into work and wait per CTA"
@@ -303,6 +311,9 @@ def main() -> None:
         help="profile a plan even if it fails the accuracy check (diagnostic only)",
     )
     args = parser.parse_args()
+    if args.tune_model:
+        tuner_for_device().tune_model(args, Path(__file__).resolve())
+        return
     if args.prompt_tokens < 1:
         parser.error("--prompt-tokens must be positive")
     if args.skip_accuracy_gate:

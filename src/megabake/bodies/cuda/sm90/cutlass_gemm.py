@@ -48,15 +48,9 @@ from ....platform import (
     pipeline,
     pipeline_init_arrive,
     pipeline_init_wait,
+    sm90_utils,
     utils,
 )
-
-try:
-    import cutlass.utils.hopper_helpers as sm90_utils
-except ImportError:
-    from ....platform import _UnavailableBackendProxy
-
-    sm90_utils = _UnavailableBackendProxy("sm90_utils")
 
 """
 A high-performance batched dense GEMM (C = A * B) example for the NVIDIA Hopper architecture

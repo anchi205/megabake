@@ -12,14 +12,16 @@ from megabake.planner import _contraction_body_order
 
 
 def test_table_gemm_contracts_are_registered_with_their_generations():
-    hopper = catalog.table_gemm("g0_range")
     blackwell = catalog.table_gemm("sm100_tma")
-    assert hopper is not None and blackwell is not None
-    assert not hopper.requires_table and blackwell.requires_table
-    assert hopper.supports_streaming and not blackwell.supports_streaming
-    assert not hopper.supports_mixed_tiles and blackwell.supports_mixed_tiles
-    assert not hopper.full_operand_descriptors and blackwell.full_operand_descriptors
-    assert not hopper.direct_store_with_splits and blackwell.direct_store_with_splits
+    assert catalog.is_table_gemm("g0_range")
+    assert catalog.table_gemm("g0_range") is None
+    assert blackwell is not None
+    assert blackwell.requires_table
+    assert not blackwell.supports_streaming
+    assert blackwell.supports_mixed_tiles
+    assert blackwell.full_operand_descriptors
+    assert blackwell.direct_store_with_splits
+    assert not catalog.is_table_gemm("generic")
     assert catalog.table_gemm("generic") is None
 
 
@@ -32,31 +34,6 @@ def test_table_gemm_registry_accepts_a_new_generation_body(monkeypatch):
         (replace(first, table_gemms=(*first.table_gemms, extra)), *catalog.GENERATIONS[1:]),
     )
     assert catalog.table_gemm("new_gemm") is extra
-
-
-def test_hopper_table_definition_preserves_launch_features():
-    hopper = catalog.table_gemm("g0_range")
-    spec = {
-        "symbol": "gemm",
-        "scratch": 73728,
-        "splits": 2,
-        "bias_features": 128,
-        "swap_ab": True,
-        "paired": True,
-    }
-    source = hopper.table_definition(spec, (128, 16), "epilogue, ", True, 3)
-    for expected in (
-        "HopperWgmmaGemmPersistentKernel(",
-        "smem_capacity=73728",
-        "splits=2",
-        "bias_features=128",
-        "bias_along_m=True",
-        "direct_store=False",
-        "epilogues=(epilogue, )",
-        "paired=True",
-        "stream_stages=3",
-    ):
-        assert expected in source
 
 
 def test_planner_accepts_provider_selection_priority():

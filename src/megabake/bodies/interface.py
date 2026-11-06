@@ -48,7 +48,6 @@ class SelectionPolicy:
     target_options: Any = None
     numerical_policy: str = "source_semantics"
     require_measured: bool = False
-    # Event scheduling uses a different launch contract than phase tables.
     event_schedule: bool = False
 
 
@@ -252,6 +251,7 @@ class Generation:
     table_gemms: tuple[TableGemmProvider, ...] = ()
     target_aliases: Mapping[str, str] = field(default_factory=dict)
     supports_wgmma: bool = False
+    tuner: Any = None
 
 
 def widened_participants(config: BodyConfig, threads: int) -> ParticipantContract:

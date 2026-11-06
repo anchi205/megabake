@@ -20,7 +20,7 @@ class Sm100TableGemm:
             "    build_sm100_table_descriptors as build_table_descriptors,\n"
             ")\n"
             "from megabake.bodies.cuda.sm100.persistent_gemm import Sm100PersistentGemm\n"
-            "from megabake.bodies.cuda.sm90.gemm import table_descriptors\n"
+            "from megabake.bodies.cuda.sm100.descriptors import table_descriptors\n"
         )
         if persistent_gemm_settings().cutlass_fork:
             imports += "from megabake.bodies.cuda.sm100.cutlass_gemm import Sm100CutlassForkGemm\n"

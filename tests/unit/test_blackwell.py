@@ -379,7 +379,7 @@ def test_sm100_tuning_fingerprint_separates_persistent_variants(monkeypatch):
 
 
 def test_sm100_measured_choice_controls_tile_and_split(monkeypatch):
-    from megabake.bodies.cuda.sm90.gemm import split_k
+    from megabake.bodies.gemm import split_k
     from megabake.bodies.cuda.sm100 import tuning
 
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
@@ -411,7 +411,7 @@ def test_sm100_measured_choice_controls_tile_and_split(monkeypatch):
 
 @pytest.mark.parametrize("columns, expected", [(2048, 2), (8192, 1)])
 def test_sm100_split_limit_avoids_second_wave(monkeypatch, columns, expected):
-    from megabake.bodies.cuda.sm90.gemm import split_k
+    from megabake.bodies.gemm import split_k
 
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN_TILE", "128")
@@ -520,7 +520,7 @@ def test_sm100_selects_stateful_attention_without_hopper_wgmma():
 
     assert selection.selections
     assert selection.report.complete
-    attention = next(s.body for s in selection.selections if s.body.provider == "attention")
+    attention = next(s.body for s in selection.selections if s.body.provider == "sm100_attention")
     assert attention.name == "attention_stateful_decode_rows"
     assert not attention.evidence.measured
     assert not attention.evidence.measurements
@@ -541,7 +541,8 @@ def test_attention_rejects_unvalidated_targets(architecture, supports_wgmma, thr
     selection = select_bodies(graph, target, SelectionPolicy(mode="decode"))
 
     assert not selection.selections
-    assert any(rejection.provider == "attention" for rejection in selection.rejections)
+    expected_provider = "attention" if architecture == "sm90a" else "sm100_attention"
+    assert any(rejection.provider == expected_provider for rejection in selection.rejections)
 
 
 def test_isolated_benchmark_maps_non_self_inverse_input_permutation():

@@ -11,8 +11,41 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(autouse=True)
 def reset_dynamo():
-    # Every parameter represents a distinct graph and backend configuration.
     torch._dynamo.reset()
+
+
+def test_shape_tuning_file_accepts_original_settings(monkeypatch, tmp_path):
+    from argparse import Namespace
+
+    from megabake import compiler
+    from megabake.bodies.catalog import cuda_target
+    from megabake.bodies.cuda.sm100 import tuning
+
+    for name in (
+        "MEGABAKE_SM100_TUNING_FILE",
+        "MEGABAKE_SM100_TCGEN",
+        "MEGABAKE_SM100_TCGEN_DECODE",
+        "MEGABAKE_SM100_TCGEN_MAX_ROWS",
+        "MEGABAKE_SM100_TCGEN_TILE",
+        "MEGABAKE_SM100_SPLIT_K",
+        "MEGABAKE_SM100_EPILOGUE",
+    ):
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MEGABAKE_SM100_EPILOGUE", "1")
+    monkeypatch.setattr(compiler, "_TABLE_LAUNCH_OPS", compiler._TABLE_LAUNCH_OPS)
+    output = tmp_path / "tuning.json"
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        tuning.tune_gemm(
+            Namespace(
+                tune_shapes=["128x512"], tune_rows=1, tune_cache_mib=0,
+                tune_split_limits=["1"], samples=5, output=output,
+            )
+        )
+    monkeypatch.setenv("MEGABAKE_SM100_EPILOGUE", "1")
+    monkeypatch.setenv("MEGABAKE_SM100_TUNING_FILE", str(output))
+    target = cuda_target(torch.cuda.get_device_properties(0))
+    assert tuning.choice_for_shape(target, 1, 128, 512) in ((64, 1), (128, 1))
 
 
 def test_graphed_baseline_copies_new_tokens():
@@ -102,7 +135,7 @@ def test_sm100_auto_tile_mixes_tiles_in_one_kernel(monkeypatch, tmp_path):
 )
 def test_sm100_split_k_repeats_and_rebinds(monkeypatch, tmp_path, tile, splits, rows, columns):
     from megabake import compiler, make_backend
-    from megabake.bodies.cuda.sm90.gemm import split_k
+    from megabake.bodies.gemm import split_k
 
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN_TILE", str(tile))
@@ -231,7 +264,7 @@ def test_sm100_tcgen_extended_prefill_rows(monkeypatch, tmp_path, rows):
 )
 def test_sm100_wider_token_tiles(monkeypatch, tmp_path, rows, token_tile, feature_tile, splits):
     from megabake import compiler, make_backend
-    from megabake.bodies.cuda.sm90.gemm import split_k
+    from megabake.bodies.gemm import split_k
 
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN_TILE", str(feature_tile))
@@ -394,7 +427,7 @@ def test_sm100_tcgen_multiple_tiles_per_worker(
     monkeypatch, tmp_path, fused, splits, persistent, acc_stages, width, fork
 ):
     from megabake import compiler, graphed, make_backend
-    from megabake.bodies.cuda.sm90.gemm import split_k
+    from megabake.bodies.gemm import split_k
     from megabake.bodies.cuda.sm100 import tuning
 
     monkeypatch.delenv("MEGABAKE_SM100_TUNING_FILE", raising=False)
@@ -504,7 +537,7 @@ def test_persistent_gemm_matches_existing_body(
     monkeypatch, tmp_path, rows, fused, splits, width, acc_stages, fork
 ):
     from megabake import compiler, make_backend
-    from megabake.bodies.cuda.sm90.gemm import split_k
+    from megabake.bodies.gemm import split_k
 
     monkeypatch.delenv("MEGABAKE_SM100_TUNING_FILE", raising=False)
     monkeypatch.setenv("MEGABAKE_SM100_TCGEN", "1")

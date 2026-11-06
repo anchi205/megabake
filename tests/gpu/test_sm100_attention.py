@@ -40,7 +40,9 @@ def test_sm100_prefill_attention_and_rebinding(tmp_path, precise_bf16_reference,
     backend, actual, expected = compile_and_compare(model, tmp_path, (source, key, value, mask))
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert backend.megabake_last_compiled.plan.launch.architecture == "sm100"
-    assert any(p.body.provider == "attention" for p in backend.megabake_last_compiled.plan.phases)
+    assert any(
+        p.body.provider == "sm100_attention" for p in backend.megabake_last_compiled.plan.phases
+    )
     assert backend.megabake_contexts[-1].requirements["execution"] == "megakernel"
 
     new_mask = torch.randn_like(mask)
@@ -127,8 +129,6 @@ def test_sm100_split_decode_preserves_cache(
 ):
     from megabake import compiler
 
-    # Exercise the table launch and split-context implementation with a small
-    # graph instead of requiring a full checkpoint.
     monkeypatch.setattr(compiler, "_TABLE_LAUNCH_OPS", 0)
     torch.manual_seed(28)
     query = torch.randn(1, 1, 4, 64, device="cuda", dtype=torch.bfloat16)
@@ -160,7 +160,9 @@ def test_sm100_split_decode_preserves_cache(
         backend.megabake_last_compiled.generated.launch.launch_policy
         == "megabake_cooperative_table"
     )
-    assert any(p.body.provider == "attention" for p in backend.megabake_last_compiled.plan.phases)
+    assert any(
+        p.body.provider == "sm100_attention" for p in backend.megabake_last_compiled.plan.phases
+    )
     assert backend.megabake_contexts[-1].requirements["execution"] == "megakernel"
 
 
@@ -176,7 +178,7 @@ def test_sm100_compiles_small_causal_model(tmp_path, precise_bf16_reference):
         expected = model(ids, attention_mask=mask).logits.float()
     assert ((actual - expected).norm() / expected.norm()).item() < 0.02
     providers = Counter(p.body.provider for p in backend.megabake_last_compiled.plan.phases)
-    assert providers["attention"] > 0
+    assert providers["sm100_attention"] > 0
     assert providers["blackwell_mma"] > 0
     assert backend.megabake_contexts[-1].requirements["execution"] == "megakernel"
     assert backend.megabake_last_trace[-1].workload_kernel_launches == 1
